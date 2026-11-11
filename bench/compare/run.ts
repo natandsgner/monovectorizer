@@ -1,0 +1,564 @@
+// Vectorizer comparison: LogoLab vs VTracer / Potrace / StarVector on authored-SVG corpora.
+//
+//   node --experimental-strip-types bench/compare/run.ts [--tools a,b] [--corpus x,y] [--limit n]
+//        [--res 512] [--run name] [--no-svgbench] [--no-cache] [--gate-exact]
+//        [--fit key=value,…] [--fresh] [--shard i/n] [--progress-from <commit>]
+//
+// Why authored SVGs: the answer sheet has to be the vector art that produced the pixels, or
+// "correct" cannot be told from "like the other tracer". StarVector's SVG-Bench scores the
+// same way (it rasterizes the dataset's source SVG), so the held-out corpora are ITS published
+// split — svg-emoji test — and, because this is a LOGO tool, 300 CC0 brand marks from
+// gilbarbara/logos (logos-cc0, the first headline), both frozen in manifests/; the in-sample
+// LogoLab corpora (truth tier 0, Fluent flat twins) run as a labelled development lane. See corpus.ts.
+//
+// Every tool gets the same input — the case's authored SVG rasterized with resvg on white at
+// --res (the truth gate's own raster) — and every output goes through ONE scoring path
+// (score.ts): resvg render → shipped ΔE, svgGround geometry → truth-gate metrics, and the
+// SVG-Bench metrics in one Python batch pass (py/svgbench_metrics.py). StarVector resizes
+// that PNG to its native 224px itself; its output is scored at --res like everyone else.
+// A trace that fails, or renders nothing resvg can draw, is a FAILURE row, never dropped.
+//
+// Tools (all local, under the gitignored .bench-tools/):
+//   logolab-auto, logolab-gate                    in-process (adapters/logolab.ts) + 4 ablation rows
+//   vtracer-default, vtracer-poster, vtracer-swept cargo install vtracer --version 0.6.4 --locked --root .bench-tools/vtracer
+//   potrace (mono lane), potrace-bin (every case) potrace-1.16.win64.zip → .bench-tools/potrace/
+//   autotrace-default, autotrace-swept             AutoTrace 0.40.0 win64 → .bench-tools/autotrace/ (adapters/external.ts)
+//   imagetracer-default, -fills, -swept           npm imagetracerjs@1.2.6 → .bench-tools/imagetracer/, in-process (adapters/imagetracer.ts)
+//   starvector-1b                                 .bench-tools/starvector-venv + HF weights (adapters/starvector.ts)
+//   omnisvg-4b                                    .bench-tools/omnisvg-venv + omnisvg-src + HF weights (adapters/omnisvg.ts)
+//   logolab-strokes, logolab-outline              LINE corpora only: traceIcon mode=mono with / without `strokes`
+//   autotrace-centerline                          LINE corpora only: AutoTrace -centerline on the luma<128 PBM
+// Setup (all of it, pinned): bench/compare/py/setup.sh. Data: py/fetch_svgbench.py (emoji),
+// fetchLogos.ts (logos-cc0, the logo headline), fetchStrokesOss.ts (strokes-oss).
+//
+// LINE corpora (strokes-oss, corpus.ts): stroke icons whose authored `d` is the answer. They
+// are rasterized at their own fixed resolution — the A/B line lane's, the flat cap (2048) —
+// not --res (`--line-res n` overrides it for a quick look), scored as centrelines by
+// score.ts scoreLine (bench/centerlineScore.ts via lineDoc.ts) next to the pixel metrics,
+// and reported in their own table. Tools marked `kinds: ['line']` run only there; every
+// other tool runs on both kinds, an outline tracer getting 'no strokes' for the centreline.
+// --skip-tools a,b drops tools for one run (e.g. starvector on the 668-row corpus).
+//
+// Output: .bench-tools/results/<run>/ — cases/<corpus>/<case>/{truth.png,<tool>.svg,<tool>.png},
+// results.json (every row + run metadata), summary.md, pairs.jsonl / svgbench.jsonl, and an
+// overlay.json per case (node + kink positions, overlay.ts).
+// External tools are cached by (tool version, PNG bytes) in .bench-tools/compare-cache/;
+// LogoLab is always re-traced (it is what changes).
+//
+// A run writes its progress as it goes (progress.ts, <run>/progress/): LogoLab's traces,
+// every scored row, and the SVG-Bench rows. Started again with the same --run, it skips
+// whatever the SAME code state already finished — a hang, a reboot or a sleeping PC costs
+// the case it stopped on, not the run. Entries are keyed by the code (HEAD + dirty diff) and
+// the inputs, so after a tracer or scorer change they simply stop matching. --fresh ignores
+// them.
+//
+// --progress-from <commit> also takes what a clean-tree run at <commit> saved: for a change
+// to the BENCH that cannot move a number (v8 needed one: the score loop never yielded, so
+// resvg's memory was never freed — render.ts releaseRenders). Refused when the tracer (src/)
+// differs from <commit>; the bench files that differ are printed and recorded in meta.
+//
+// --shard i/n traces and scores only every n-th case (from the i-th, 0-based), saves its rows
+// as progress and stops: no SVG-Bench, no results.json. n of them side by side use n cores;
+// the run without --shard then finds every row saved and only merges. Scoring is one core.
+//
+// --fit overrides planar fit defaults (DEFAULT_PLANAR_FIT) for every LogoLab row — a
+// tracer change measured off and on without editing code (`--fit lineTangents=false`). It
+// is recorded in meta, and a run made with it is a measurement, not a published result.
+//
+// --gate-exact scores the traced side WITHOUT the visible-boundary filter, which is how the
+// truth gate scores; with it, logolab-gate on truth0 reproduces test/truth-gate.test.ts.
+
+import { createHash } from 'node:crypto'
+import { execFileSync, spawn } from 'node:child_process'
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { join, relative } from 'node:path'
+import { ensureImageData } from '../nodeHarness.ts'
+import { encodePng } from '../../src/lib/png/encode.ts'
+import { parseGroundTruth, toRasterSpace, unscorable } from '../svgGround.ts'
+import { DEFAULT_PLANAR_FIT } from '../../src/lib/trace/planarFit.ts'
+import { CACHE, PY, RESULTS, REPO, VENV_PY } from './paths.ts'
+import { CORPORA, DEFAULT_CORPORA, inkOf, loadCorpus } from './corpus.ts'
+import { LOGOS_COMMIT } from './logosCc0.ts'
+import { releaseRenders, renderGround } from './render.ts'
+import { scorePixels, scoreTrace, type Truth } from './score.ts'
+import { attributionMarkdown } from './hfCard.ts'
+import { summaryMarkdown } from './report.ts'
+import { writeOverlays } from './overlay.ts'
+import { progress, readSvgbenchRows } from './progress.ts'
+import {
+  logolabAblation,
+  logolabAuto,
+  logolabGate,
+  logolabOutline,
+  logolabStrokes,
+  provenance,
+} from './adapters/logolab.ts'
+import {
+  AUTOTRACE_SWEPT,
+  autotraceCenterline,
+  autotraceDefault,
+  autotraceSwept,
+  potrace,
+  potraceBin,
+  vtracerDefault,
+  vtracerPoster,
+  vtracerSwept,
+  VTRACER_SWEPT,
+} from './adapters/external.ts'
+import { omnisvg, omnisvgProvenance } from './adapters/omnisvg.ts'
+import { imagetracerDefault, imagetracerFills, imagetracerSwept } from './adapters/imagetracer.ts'
+import { starvector, starvectorProvenance } from './adapters/starvector.ts'
+import {
+  corpusKind,
+  type CompareCase,
+  type CorpusId,
+  type ScoreRow,
+  type TraceInput,
+  type TraceResult,
+  type TracerAdapter,
+} from './types.ts'
+import { parseLineArt } from '../lineArtGround.ts'
+
+ensureImageData()
+
+// Order is the table's: the user-facing LogoLab row first, the oracle reference row after.
+const ALL_TOOLS: TracerAdapter[] = [
+  logolabAuto,
+  logolabGate,
+  logolabStrokes,
+  logolabOutline,
+  vtracerDefault,
+  vtracerPoster,
+  vtracerSwept,
+  autotraceDefault,
+  autotraceSwept,
+  autotraceCenterline,
+  imagetracerDefault,
+  imagetracerFills,
+  imagetracerSwept,
+  starvector,
+  omnisvg,
+  potrace,
+  potraceBin,
+  ...logolabAblation,
+]
+
+const argv = process.argv.slice(2)
+const arg = (k: string): string | undefined => {
+  const i = argv.indexOf(k)
+  return i >= 0 ? argv[i + 1] : undefined
+}
+const has = (k: string): boolean => argv.includes(k)
+const list = (k: string): string[] | undefined =>
+  arg(k)
+    ?.split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+
+const RES = Number(arg('--res') ?? 512)
+// A line corpus keeps its own raster (CompareCase.res: the A/B line lane's flat cap);
+// --line-res overrides it for the line corpora only — a quick look, not a published run.
+const LINE_RES = arg('--line-res') ? Number(arg('--line-res')) : null
+const resOf = (c: CompareCase): number =>
+  corpusKind(c.corpus) === 'line' ? (LINE_RES ?? c.res ?? RES) : (c.res ?? RES)
+const LIMIT = arg('--limit') ? Number(arg('--limit')) : Infinity
+const SHARD = ((s): { i: number; n: number } | null => {
+  if (!s) return null
+  const [i, n] = s.split('/').map(Number)
+  if (!Number.isInteger(i) || !Number.isInteger(n) || n < 1 || i < 0 || i >= n)
+    throw new Error(`--shard ${s}: expected i/n with 0 ≤ i < n`)
+  return { i, n }
+})(arg('--shard'))
+const corpusIds = (list('--corpus') ?? DEFAULT_CORPORA) as CorpusId[]
+for (const c of corpusIds) if (!CORPORA.includes(c)) throw new Error(`unknown corpus ${c} (have ${CORPORA.join(', ')})`)
+const toolNames = list('--tools')
+for (const t of toolNames ?? [])
+  if (!ALL_TOOLS.some((a) => a.name === t))
+    throw new Error(`unknown tool ${t} (have ${ALL_TOOLS.map((a) => a.name).join(', ')})`)
+const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+const RUN = arg('--run') ?? stamp
+const runDir = join(RESULTS, RUN)
+const useCache = !has('--no-cache')
+const docVisible = !has('--gate-exact')
+const FIT_RECOMPUTED = ['lineCost', 'smoothPasses']
+const fitOverrides: Record<string, boolean | number> = {}
+for (const kv of list('--fit') ?? []) {
+  const [k, v] = kv.split('=')
+  if (!(k in DEFAULT_PLANAR_FIT)) throw new Error(`--fit: unknown planar fit option ${k}`)
+  // planarFitOptionsFor (src/lib/trace/index.ts) recomputes these from the dials after
+  // spreading the defaults, so an override would be recorded in meta and not measured.
+  if (FIT_RECOMPUTED.includes(k))
+    throw new Error(`--fit: ${k} is set from the dials per trace and cannot be overridden`)
+  fitOverrides[k] = v === 'true' ? true : v === 'false' ? false : Number(v)
+}
+Object.assign(DEFAULT_PLANAR_FIT, fitOverrides)
+
+const caseDir = (c: CompareCase): string => join(runDir, 'cases', c.corpus, c.name.replace(/[^\w.-]+/g, '_'))
+const sha1 = (b: Uint8Array | string): string => createHash('sha1').update(b).digest('hex')
+
+async function main(): Promise<void> {
+  // ── provenance, taken ONCE before anything runs (HEAD can move during a long run)
+  const prov = provenance()
+  if (prov.dirty)
+    console.log(
+      `  ⚠ working tree differs from ${prov.head} under src/ bench/ (${prov.status.length} paths) — recorded in meta`,
+    )
+  // ── progress on disk (progress.ts): reusable only by this code state and these options
+  const saved = progress(runDir, has('--fresh'))
+  const keyOf = (rev: string): string => sha1(JSON.stringify({ rev, docVisible, fitOverrides }))
+  const codeKey = keyOf(prov.dirty ? `${prov.head}+${prov.diffSha1}` : prov.head)
+  // --progress-from: an earlier clean-tree commit whose entries this run accepts too. Same
+  // tracer or nothing — its traces would not be this code's; the bench diff is on record.
+  const git = (...a: string[]): string => execFileSync('git', a, { cwd: REPO, encoding: 'utf8' })
+  const carried = (list('--progress-from') ?? []).map((given) => {
+    const rev = git('rev-parse', '--short', given).trim()
+    const src = git('diff', '--name-only', rev, '--', 'src').split('\n').filter(Boolean)
+    const untracked = prov.status.filter((l) => l.startsWith('?? src/'))
+    if (src.length || untracked.length)
+      throw new Error(`--progress-from ${rev}: the tracer differs (${[...src, ...untracked].join(', ')})`)
+    const benchChanged = git('diff', '--name-only', rev, '--', 'bench').split('\n').filter(Boolean)
+    console.log(`  ↺ accepting progress saved at ${rev}; bench differs in: ${benchChanged.join(', ') || 'nothing'}`)
+    return { rev, key: keyOf(rev), benchChanged }
+  })
+  // A LogoLab version string carries the rev it was traced at (adapters/logolab.ts).
+  const versionAt = (version: string, rev: string): string => version.replace(/^logolab@\S+/, `logolab@${rev}`)
+  // ── tools
+  const skip = list('--skip-tools') ?? []
+  const wanted = (toolNames ? ALL_TOOLS.filter((t) => toolNames.includes(t.name)) : ALL_TOOLS).filter(
+    (t) => !skip.includes(t.name),
+  )
+  const tools: { a: TracerAdapter; version: string }[] = []
+  for (const a of wanted) {
+    const why = await a.available()
+    if (why) {
+      console.log(`  ⨯ ${a.name}: skipped — ${why}`)
+      continue
+    }
+    tools.push({ a, version: await a.version() })
+    console.log(`  ✓ ${a.name}: ${tools[tools.length - 1].version}`)
+  }
+
+  // ── cases: truth raster, answer sheet, lane
+  const cases: { c: CompareCase; truth: Truth; input: TraceInput; gtSvgPath: string; pngSha: string }[] = []
+  let caseIndex = 0
+  for (const id of corpusIds) {
+    const cs = loadCorpus(id).slice(0, LIMIT)
+    console.log(`  ${id}: ${cs.length} cases${SHARD ? ` (shard ${SHARD.i}/${SHARD.n} takes every ${SHARD.n}th)` : ''}`)
+    for (const c of cs) {
+      if (SHARD && caseIndex++ % SHARD.n !== SHARD.i) continue
+      await releaseRenders()
+      const svg = readFileSync(c.svgPath, 'utf8')
+      const line = corpusKind(c.corpus) === 'line'
+      const img = renderGround(svg, resOf(c))
+      // A line case's answer sheet is its strokes (lineArtGround); svgGround's outline
+      // reader refuses them, and for an outline that refusal is right — so a line case
+      // carries no outline shapes, and its refusal is the stroke reader's.
+      const gt = parseGroundTruth(svg)
+      const refusal = line ? (parseLineArt(svg).strokes.length ? null : 'no strokes') : unscorable(gt)
+      // Exactly as the truth gate maps the answer sheet (the raster is fitTo-width).
+      const shapes = refusal || line ? null : toRasterSpace(gt, img.width)
+      const dir = caseDir(c)
+      mkdirSync(dir, { recursive: true })
+      const pngPath = join(dir, 'truth.png')
+      const png = encodePng(img.data, img.width, img.height)
+      writeFileSync(pngPath, png)
+      cases.push({
+        c,
+        truth: { img, shapes, refusal, ...(line && !refusal ? { lineSvg: svg } : {}) },
+        input: { pngPath, image: img, ...inkOf(img), case: c },
+        gtSvgPath: c.svgPath,
+        pngSha: sha1(png),
+      })
+    }
+  }
+  console.log(
+    `  ${cases.length} cases (${cases.filter((k) => k.input.lane === 'mono').length} mono), ${tools.length} tools, ` +
+      `${[...new Set(cases.map((k) => k.truth.img.width))].join(' / ')}px → ${relative(REPO, runDir)}`,
+  )
+
+  // ── trace
+  const traces = new Map<string, TraceResult | { error: string }>() // `${tool}|${caseId}`
+  for (const { a, version } of tools) {
+    const mine = cases.filter(
+      (k) => a.lanes.includes(k.input.lane) && (a.kinds ?? ['fill', 'line']).includes(corpusKind(k.c.corpus)),
+    )
+    console.log(`\n━━ ${a.name} — ${mine.length} cases`)
+    const cacheable = !a.name.startsWith('logolab') && useCache
+    const cachePath = (k: (typeof cases)[number]): string => join(CACHE, a.name, `${sha1(version + k.pngSha)}.json`)
+    // What is not cached across runs (LogoLab) is still kept for THIS run, under this code state.
+    const traceKey = (k: (typeof cases)[number]): string[] => [
+      sha1(codeKey + version + k.pngSha),
+      ...carried.map((f) => sha1(f.key + versionAt(version, f.rev) + k.pngSha)),
+    ]
+    const todo: typeof mine = []
+    let resumed = 0
+    for (const k of mine) {
+      const p = cachePath(k)
+      const kept = cacheable ? null : saved.get<TraceResult>(`traces/${a.name}`, k.c.id, traceKey(k))
+      if (cacheable && existsSync(p)) traces.set(`${a.name}|${k.c.id}`, JSON.parse(readFileSync(p, 'utf8')))
+      else if (kept) {
+        traces.set(`${a.name}|${k.c.id}`, kept)
+        resumed++
+      } else todo.push(k)
+    }
+    if (todo.length < mine.length - resumed) console.log(`  ${mine.length - todo.length - resumed} from cache`)
+    if (resumed) console.log(`  ${resumed} from this run's progress`)
+    const store = (k: (typeof cases)[number], r: TraceResult | { error: string }): void => {
+      traces.set(`${a.name}|${k.c.id}`, r)
+      if ('error' in r) return // a failure is tried again, here as in the cache
+      if (cacheable) {
+        mkdirSync(join(CACHE, a.name), { recursive: true })
+        writeFileSync(cachePath(k), JSON.stringify(r))
+      } else saved.put(`traces/${a.name}`, k.c.id, traceKey(k)[0], r)
+    }
+    if (a.traceBatch && todo.length) {
+      const res = await a.traceBatch(
+        todo.map((k) => k.input),
+        join(runDir, 'batch', a.name),
+      )
+      for (const k of todo) store(k, res.get(k.c.id) ?? { error: 'no result from batch' })
+    } else if (a.trace) {
+      for (const k of todo) {
+        try {
+          const r = await a.trace(k.input)
+          store(k, r)
+          console.log(`  ${k.c.id}  ${r.ms.toFixed(0)}ms${r.notes ? `  ${r.notes.slice(0, 80)}` : ''}`)
+        } catch (e) {
+          store(k, { error: (e as Error).message.split('\n')[0] })
+          console.log(`  ${k.c.id}  ✗ ${(e as Error).message.split('\n')[0]}`)
+        }
+      }
+    }
+  }
+
+  // ── score
+  const rows: ScoreRow[] = []
+  const pairs: string[] = []
+  let resumedRows = 0
+  for (const k of cases) {
+    const dir = caseDir(k.c)
+    for (const { a } of tools) {
+      const t = traces.get(`${a.name}|${k.c.id}`)
+      if (!t) continue // lane not run by this tool
+      await releaseRenders() // or every render of the pass stays in memory (render.ts)
+      const pngOut = join(dir, `${a.name}.png`)
+      const svgOut = join(dir, `${a.name}.svg`)
+      const pair = (gen_svg?: string): void => {
+        pairs.push(
+          JSON.stringify({
+            key: `${a.name}|${k.c.id}`,
+            gt_png: k.input.pngPath,
+            gen_png: pngOut,
+            gen_svg,
+            gt_svg: k.gtSvgPath,
+          }),
+        )
+      }
+      // A row this code state already scored from this very output: its files are on disk.
+      type Kept = { row: ScoreRow; paired: null | { svg: boolean } }
+      const traceSha = sha1(JSON.stringify(t))
+      const rowKey = sha1(codeKey + k.pngSha + traceSha)
+      const kept = saved.get<Kept>(`rows/${a.name}`, k.c.id, [
+        rowKey,
+        ...carried.map((f) => sha1(f.key + k.pngSha + traceSha)),
+      ])
+      if (kept && (!kept.paired || existsSync(pngOut)) && (!kept.paired?.svg || existsSync(svgOut))) {
+        rows.push(kept.row)
+        if (kept.paired) pair(kept.paired.svg ? svgOut : undefined)
+        resumedRows++
+        continue
+      }
+      let paired: Kept['paired'] = null
+      const keep = (row: ScoreRow): void => {
+        rows.push(row)
+        saved.put(`rows/${a.name}`, k.c.id, rowKey, { row, paired } satisfies Kept)
+      }
+      if ('error' in t) {
+        // No SVG: scored as a blank white image in every pixel metric, SVG-Bench's included.
+        const blank = scorePixels(k.c, k.truth, a.name, null, k.input.lane, {
+          status: 'trace-failed',
+          error: t.error,
+          ms: null,
+        })
+        writeFileSync(pngOut, encodePng(blank.render.data, blank.render.width, blank.render.height))
+        pair()
+        paired = { svg: false }
+        keep(blank.row)
+        continue
+      }
+      writeFileSync(svgOut, t.svg)
+      let scored: { row: ScoreRow; render: { width: number; height: number; data: Uint8ClampedArray } | null }
+      try {
+        scored = scoreTrace(k.c, k.truth, a.name, t.svg, t.ms, k.input.lane, { docVisible, notes: t.notes })
+      } catch (e) {
+        // A scorer crash on one output must not cost the run, and must not vanish: the row
+        // keeps the pixel metrics of the output's own render (white if resvg refuses it).
+        scored = scorePixels(k.c, k.truth, a.name, t.svg, k.input.lane, {
+          status: 'render-failed',
+          error: `scorer: ${(e as Error).message}`,
+          ms: t.ms,
+        })
+      }
+      if (scored.render) {
+        writeFileSync(pngOut, encodePng(scored.render.data, scored.render.width, scored.render.height))
+        pair(svgOut)
+        paired = { svg: true }
+      }
+      keep(scored.row)
+      const r = scored.row
+      console.log(
+        `  ${a.name.padEnd(16)} ${k.c.id.padEnd(48).slice(0, 48)} ${r.status === 'ok' ? '' : r.status} ` +
+          `ΔE ${r.meanDeltaE?.toFixed(2) ?? '—'}  ` +
+          (k.truth.lineSvg !== undefined
+            ? `centre ${r.clCentre?.toFixed(2) ?? r.geomRefusal ?? '—'}  missed ${r.clMissed?.toFixed(2) ?? '—'}  width ${r.clWidthErr !== undefined ? `${(r.clWidthErr * 100).toFixed(0)}%` : '—'}  ends ${r.clEndsDelta ?? '—'}  turns ${r.clTurns ?? '—'}  `
+            : `chamfer ${r.chamfer?.toFixed(2) ?? r.geomRefusal ?? r.gtRefusal ?? '—'}  `) +
+          `nodes ${r.docNodes ?? '—'}  gates ${r.gatesPassed ?? 0}/${r.gatesApplicable ?? 0}`,
+      )
+    }
+  }
+  if (resumedRows) console.log(`  ${resumedRows} rows from this run's progress`)
+  if (SHARD) {
+    console.log(
+      `\nshard ${SHARD.i}/${SHARD.n}: ${rows.length} rows saved (${resumedRows} were already) — run without --shard to merge`,
+    )
+    return
+  }
+
+  // ── SVG-Bench metrics, one Python pass
+  mkdirSync(runDir, { recursive: true })
+  const pairsPath = join(runDir, 'pairs.jsonl')
+  writeFileSync(pairsPath, pairs.join('\n') + '\n')
+  // Node + kink positions per case, for the labs' node view (overlay.ts).
+  const resById = new Map(cases.map((k) => [k.c.id, k.truth.img.width]))
+  console.log(`  overlays: ${await writeOverlays(runDir, RES, (id) => resById.get(id))} cases`)
+  let sbNotes: unknown = 'skipped (--no-svgbench)'
+  if (!has('--no-svgbench')) {
+    if (!existsSync(VENV_PY)) sbNotes = `skipped: no Python venv at ${VENV_PY}`
+    else {
+      const out = join(runDir, 'svgbench.jsonl')
+      // The pass writes rows as it goes (svgbench-new.jsonl while it runs), each carrying the
+      // digest of what it scored — both images, both SVGs and the script itself. A row from
+      // an earlier pass of this run is reused while its digest still matches; only the rest
+      // goes to Python.
+      const script = join(PY, 'svgbench_metrics.py')
+      const scriptSha = sha1(readFileSync(script))
+      const fileSha = (p?: string): string => (p && existsSync(p) ? sha1(readFileSync(p)) : '-')
+      const all = pairs.map((l) => {
+        const p = JSON.parse(l) as { key: string; gt_png: string; gen_png: string; gen_svg?: string; gt_svg: string }
+        const digest = sha1(
+          [scriptSha, fileSha(p.gt_png), fileSha(p.gen_png), fileSha(p.gen_svg), fileSha(p.gt_svg)].join(),
+        )
+        return { ...p, digest }
+      })
+      const newOut = join(runDir, 'svgbench-new.jsonl')
+      const before = has('--fresh') ? null : [readSvgbenchRows(out), readSvgbenchRows(newOut)]
+      const byKey = new Map<string, Record<string, unknown>>()
+      let metaSeen: unknown = null
+      for (const prev of before ?? []) {
+        if (prev.meta) metaSeen = prev.meta
+        for (const [key, row] of prev.rows) byKey.set(key, row)
+      }
+      const todo = all.filter((p) => byKey.get(p.key)?.digest !== p.digest)
+      console.log(
+        `\n━━ SVG-Bench metrics (${all.length} pairs${todo.length < all.length ? `, ${all.length - todo.length} from this run's progress` : ''})`,
+      )
+      let code = 0
+      if (todo.length) {
+        // Python opens svgbench-new.jsonl afresh, so what an earlier pass left there is folded
+        // into svgbench.jsonl first — still matching rows only.
+        if (before && todo.length < all.length)
+          writeFileSync(
+            out,
+            [
+              JSON.stringify({ meta: metaSeen }),
+              ...all.filter((p) => byKey.get(p.key)?.digest === p.digest).map((p) => JSON.stringify(byKey.get(p.key))),
+            ].join('\n') + '\n',
+          )
+        const todoPath = join(runDir, 'pairs-todo.jsonl')
+        writeFileSync(todoPath, todo.map((p) => JSON.stringify(p)).join('\n') + '\n')
+        code = await new Promise<number>((resolve) => {
+          const p = spawn(VENV_PY, ['-I', script, '--pairs', todoPath, '--out', newOut], {
+            stdio: ['ignore', 'inherit', 'pipe'],
+          })
+          p.stderr.on('data', (b: Buffer) => {
+            const s = b.toString()
+            if (/unavailable|Error|Traceback/.test(s)) process.stderr.write(s)
+          })
+          p.on('close', (c) => resolve(c ?? 1))
+          p.on('error', () => resolve(1))
+        })
+        const fresh = readSvgbenchRows(newOut)
+        if (fresh.meta) metaSeen = fresh.meta
+        for (const [key, row] of fresh.rows) byKey.set(key, row)
+      }
+      const complete = all.every((p) => byKey.get(p.key)?.digest === p.digest)
+      if (code === 0 && complete) {
+        sbNotes = metaSeen
+        // The merged file, in pair order: what the run is published with.
+        writeFileSync(
+          out,
+          [JSON.stringify({ meta: metaSeen }), ...all.map((p) => JSON.stringify(byKey.get(p.key)))].join('\n') + '\n',
+        )
+        rmSync(newOut, { force: true })
+        rmSync(join(runDir, 'pairs-todo.jsonl'), { force: true })
+        for (const r of rows) {
+          const m = byKey.get(`${r.tool}|${r.caseId}`)
+          if (!m) continue
+          Object.assign(r, { sbMse: m.mse, sbSsim: m.ssim, sbLpips: m.lpips, sbDino: m.dino, sbTokens: m.tokens })
+        }
+      } else sbNotes = `failed (exit ${code}${complete ? '' : ', rows missing'})`
+    }
+  }
+
+  // ── write
+  const logolab = prov.dirty ? `${prov.head}+dirty` : prov.head
+  const meta = {
+    run: RUN,
+    date: new Date().toISOString(),
+    res: RES,
+    // A line corpus scores at its own fixed raster (CompareCase.res, or --line-res).
+    ...(cases.some((k) => k.truth.lineSvg !== undefined)
+      ? { lineRes: [...new Set(cases.filter((k) => k.truth.lineSvg !== undefined).map((k) => k.truth.img.width))] }
+      : {}),
+    logolab,
+    // Entries an earlier commit saved and this run took (--progress-from), with the bench
+    // files that differ from it. The tracer did not (refused otherwise).
+    ...(carried.length ? { progressFrom: carried.map(({ rev, benchChanged }) => ({ rev, benchChanged })) } : {}),
+    docVisible,
+    ...(Object.keys(fitOverrides).length ? { fit: fitOverrides } : {}),
+    corpora: corpusIds,
+    limit: Number.isFinite(LIMIT) ? LIMIT : null,
+    tools: tools.map((t) => t.a.name),
+    versions: Object.fromEntries(tools.map((t) => [t.a.name, t.version])),
+    // What a critic needs to rebuild the run: the tree state the scorer AND the tracer ran
+    // from, the pinned model / dataset revisions, and the StarVector batch's own report.
+    provenance: {
+      git: prov,
+      vtracerSwept: VTRACER_SWEPT,
+      autotraceSwept: AUTOTRACE_SWEPT,
+      starvector: tools.some((t) => t.a === starvector)
+        ? starvectorProvenance(join(runDir, 'batch', starvector.name))
+        : null,
+      omnisvg: tools.some((t) => t.a === omnisvg) ? omnisvgProvenance(join(runDir, 'batch', omnisvg.name)) : null,
+    },
+    svgbench: sbNotes,
+    cases: cases.map((k) => ({
+      id: k.c.id,
+      lane: k.input.lane,
+      license: k.c.license,
+      source: k.c.source,
+      gtRefusal: k.truth.refusal,
+      res: k.truth.img.width,
+    })),
+  }
+  writeFileSync(join(runDir, 'results.json'), JSON.stringify({ meta, rows }, null, 1))
+  writeFileSync(join(runDir, 'ATTRIBUTION.md'), attributionMarkdown(LOGOS_COMMIT))
+  const md = summaryMarkdown(rows, meta)
+  writeFileSync(join(runDir, 'summary.md'), md)
+  console.log(`\n${md}\n\nwrote ${relative(REPO, runDir)}/{results.json,summary.md}`)
+}
+
+main().catch((e) => {
+  console.error(e)
+  process.exit(1)
+})

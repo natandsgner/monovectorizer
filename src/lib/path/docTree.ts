@@ -1,0 +1,405 @@
+// Group-aware traversal and structural editing of an EditableDoc.
+//
+// `doc.items` is a tree once groups exist, but most consumers (metrics,
+// rasterization, docStats) only want the paintable leaves:
+//   leafItems()  — what renders, flattened, in paint order.
+//   walkItems()  — the tree, groups included, for the layers panel and
+//                  structural edits.
+//
+// Everything is immutable: an edit rebuilds only the groups on the path to the
+// change and shares untouched subtrees, so identity checks and undo work.
+
+import type { DocItem, EditableDoc, GroupItem, PathItem, RawItem } from './types.ts'
+
+/** A paintable item — anything that isn't a container. */
+export type Leaf = PathItem | RawItem
+
+/** A live text object — a group whose children are its laid-out glyphs. */
+export function isText(item: DocItem): item is GroupItem & { text: NonNullable<GroupItem['text']> } {
+  return item.kind === 'group' && !!item.text
+}
+
+/** True for the container kind — narrows so callers can reach `.children`. */
+export function isGroup(item: DocItem): item is GroupItem {
+  return item.kind === 'group'
+}
+
+/**
+ * Whether an item paints nothing and so is no layer: an inert raw item (defs, a
+ * shape with neither fill nor stroke), or a group holding only such items. It is
+ * still in the document — the export writes it in place — but a list of layers,
+ * a selection or a count of shapes should not see it.
+ */
+export function isInert(item: DocItem): boolean {
+  if (item.kind === 'raw') return item.inert === true
+  if (item.kind === 'group') return !item.text && item.children.length > 0 && item.children.every(isInert)
+  return false
+}
+
+/**
+ * Every paintable leaf (path / raw) in paint order, groups flattened away.
+ * Hidden groups prune their whole subtree — a hidden folder hides what's in it.
+ */
+export function leafItems(items: readonly DocItem[]): Leaf[] {
+  const out: Leaf[] = []
+  const walk = (list: readonly DocItem[], visible: boolean) => {
+    for (const it of list) {
+      const vis = visible && it.visible
+      if (isGroup(it)) walk(it.children, vis)
+      else if (vis) out.push(it)
+    }
+  }
+  walk(items, true)
+  return out
+}
+
+/** Every leaf regardless of visibility — for hit-testing an editor's own list. */
+export function allLeaves(items: readonly DocItem[]): Leaf[] {
+  const out: Leaf[] = []
+  for (const it of items) {
+    if (isGroup(it)) out.push(...allLeaves(it.children))
+    else out.push(it)
+  }
+  return out
+}
+
+/** Every PathItem in the tree, visible or not, in paint order. */
+export function allPaths(items: readonly DocItem[]): PathItem[] {
+  return allLeaves(items).filter((it): it is PathItem => it.kind === 'path')
+}
+
+/** Depth-first visit of the whole tree, groups included. Depth starts at 0. */
+export function walkItems(
+  items: readonly DocItem[],
+  visit: (item: DocItem, depth: number, parent: GroupItem | null) => void,
+  depth = 0,
+  parent: GroupItem | null = null,
+): void {
+  for (const it of items) {
+    visit(it, depth, parent)
+    if (isGroup(it)) walkItems(it.children, visit, depth + 1, it)
+  }
+}
+
+/** The item with this id, anywhere in the tree. */
+export function findItem(items: readonly DocItem[], id: string): DocItem | null {
+  for (const it of items) {
+    if (it.id === id) return it
+    if (isGroup(it)) {
+      const hit = findItem(it.children, id)
+      if (hit) return hit
+    }
+  }
+  return null
+}
+
+/** The group containing `id` (null = top level), and the index within it. */
+export function findParent(
+  items: readonly DocItem[],
+  id: string,
+  parent: GroupItem | null = null,
+): { parent: GroupItem | null; index: number } | null {
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i]
+    if (it.id === id) return { parent, index: i }
+    if (isGroup(it)) {
+      const hit = findParent(it.children, id, it)
+      if (hit) return hit
+    }
+  }
+  return null
+}
+
+/** Groups enclosing `id`, outermost first. Empty when it sits at top level. */
+export function ancestorsOf(items: readonly DocItem[], id: string): GroupItem[] {
+  const chain: GroupItem[] = []
+  const walk = (list: readonly DocItem[], acc: GroupItem[]): boolean => {
+    for (const it of list) {
+      if (it.id === id) {
+        chain.push(...acc)
+        return true
+      }
+      if (isGroup(it) && walk(it.children, [...acc, it])) return true
+    }
+    return false
+  }
+  walk(items, [])
+  return chain
+}
+
+/**
+ * Whether the item paints: it and every enclosing group must be visible. The
+ * layers panel shows a hidden-by-ancestor row differently from one the user
+ * hid directly, so this is separate from reading `item.visible`.
+ */
+export function isEffectivelyVisible(items: readonly DocItem[], id: string): boolean {
+  const item = findItem(items, id)
+  if (!item || !item.visible) return false
+  return ancestorsOf(items, id).every((g) => g.visible)
+}
+
+/** Product of the opacities of every group enclosing `id` (1 when none set). */
+export function inheritedOpacity(items: readonly DocItem[], id: string): number {
+  return ancestorsOf(items, id).reduce((acc, g) => acc * (g.opacity ?? 1), 1)
+}
+
+/* -------------------------------------------------------------- structural */
+
+/** Replace one item by id, sharing every untouched subtree. */
+export function replaceItem(items: readonly DocItem[], id: string, next: DocItem): DocItem[] {
+  return items.map((it) => {
+    if (it.id === id) return next
+    if (isGroup(it)) {
+      const kids = replaceItem(it.children, id, next)
+      return kids === it.children ? it : { ...it, children: kids }
+    }
+    return it
+  })
+}
+
+/** Map over every leaf, leaving group structure intact. Identity-stable. */
+export function mapLeaves(items: readonly DocItem[], fn: (item: DocItem) => DocItem): DocItem[] {
+  let changed = false
+  const out = items.map((it) => {
+    if (isGroup(it)) {
+      const kids = mapLeaves(it.children, fn)
+      if (kids === it.children) return it
+      changed = true
+      return { ...it, children: kids }
+    }
+    const next = fn(it)
+    if (next !== it) changed = true
+    return next
+  })
+  return changed ? out : (items as DocItem[])
+}
+
+/**
+ * Map over every item, groups included: `fn` sees a group before its children,
+ * and the children of whatever it returns are mapped in turn. Identity-stable.
+ */
+export function mapItems(items: readonly DocItem[], fn: (item: DocItem) => DocItem): DocItem[] {
+  let changed = false
+  const out = items.map((it) => {
+    let next = fn(it)
+    if (isGroup(next)) {
+      const kids = mapItems(next.children, fn)
+      if (kids !== next.children) next = { ...next, children: kids }
+    }
+    if (next !== it) changed = true
+    return next
+  })
+  return changed ? out : (items as DocItem[])
+}
+
+/** Remove every listed id from the tree. */
+export function removeItems(items: readonly DocItem[], ids: ReadonlySet<string>): DocItem[] {
+  const out: DocItem[] = []
+  for (const it of items) {
+    if (ids.has(it.id)) continue
+    if (isGroup(it)) {
+      const kids = removeItems(it.children, ids)
+      out.push(kids === it.children ? it : { ...it, children: kids })
+    } else out.push(it)
+  }
+  return out
+}
+
+/** Insert items into a parent group (null = top level) at `index`. */
+export function insertItems(
+  items: readonly DocItem[],
+  parentId: string | null,
+  index: number,
+  added: readonly DocItem[],
+): DocItem[] {
+  if (parentId === null) {
+    const out = [...items]
+    out.splice(clampIndex(index, out.length), 0, ...added)
+    return out
+  }
+  return items.map((it) => {
+    if (it.id === parentId && isGroup(it)) {
+      const kids = [...it.children]
+      kids.splice(clampIndex(index, kids.length), 0, ...added)
+      return { ...it, children: kids }
+    }
+    if (isGroup(it)) {
+      const kids = insertItems(it.children, parentId, index, added)
+      return kids === it.children ? it : { ...it, children: kids }
+    }
+    return it
+  })
+}
+
+function clampIndex(i: number, len: number): number {
+  return Math.max(0, Math.min(len, i))
+}
+
+/**
+ * Collect `ids` into a new group. The group lands where the frontmost member
+ * was, in that member's parent, so grouping never changes what the user sees.
+ * Members keep their relative order; ids nested inside another selected id are
+ * skipped (the ancestor takes them). One member is enough: a group of one is
+ * how you start a folder in Figma and Affinity, and drop more into it later.
+ */
+export function groupItems(
+  items: readonly DocItem[],
+  ids: ReadonlySet<string>,
+  groupId: string,
+  name?: string,
+): { items: DocItem[]; groupId: string } | null {
+  const top = topLevelSelection(items, ids)
+  if (top.length === 0) return null
+
+  // Paint order of the survivors, so the group's children keep their stacking.
+  const order = new Map<string, number>()
+  let n = 0
+  walkItems(items, (it) => {
+    if (top.includes(it.id)) order.set(it.id, n++)
+  })
+  const members = top
+    .slice()
+    .sort((a, b) => (order.get(a) ?? 0) - (order.get(b) ?? 0))
+    .map((id) => findItem(items, id))
+    .filter((it): it is DocItem => it !== null)
+  if (members.length === 0) return null
+
+  const frontId = members[members.length - 1].id
+  const anchor = findParent(items, frontId)
+  if (!anchor) return null
+
+  // Remove first, then insert at the anchor's index recomputed post-removal:
+  // pulling members out from below the anchor shifts it down by that many.
+  const removedBefore = anchor.parent
+    ? anchor.parent.children.filter((c, i) => i < anchor.index && ids.has(c.id)).length
+    : items.filter((c, i) => i < anchor.index && ids.has(c.id)).length
+  const stripped = removeItems(items, new Set(top))
+  const group: GroupItem = {
+    kind: 'group',
+    id: groupId,
+    name,
+    children: members,
+    visible: true,
+    expanded: true,
+  }
+  return {
+    items: insertItems(stripped, anchor.parent?.id ?? null, anchor.index - removedBefore, [group]),
+    groupId,
+  }
+}
+
+/** Splice a group's children back into its parent, in place. */
+export function ungroup(items: readonly DocItem[], groupId: string): DocItem[] | null {
+  const group = findItem(items, groupId)
+  if (!group || !isGroup(group)) return null
+  const at = findParent(items, groupId)
+  if (!at) return null
+  // A hidden group hid its children; ungrouping must not silently reveal them.
+  const kids = group.visible ? group.children : group.children.map((c) => ({ ...c, visible: false }))
+  const stripped = removeItems(items, new Set([groupId]))
+  return insertItems(stripped, at.parent?.id ?? null, at.index, kids)
+}
+
+/**
+ * Move `ids` to a paint-order insertion point (a layers-panel drag). Returns
+ * null when the move is impossible (a group into its own subtree) or a no-op,
+ * so it doesn't cost an empty undo step.
+ *
+ * `index` refers to the original tree; since the movers are removed before the
+ * insert, each mover that sat before the target in the same parent shifts it
+ * down by one.
+ */
+export function moveItems(
+  items: readonly DocItem[],
+  ids: ReadonlySet<string>,
+  to: { parentId: string | null; index: number },
+): DocItem[] | null {
+  const top = topLevelSelection(items, ids)
+  if (top.length === 0) return null
+  const moving = new Set(top)
+
+  if (to.parentId !== null) {
+    const dest = findItem(items, to.parentId)
+    if (!dest || !isGroup(dest)) return null
+    // A group cannot be dropped inside itself, or inside anything it contains.
+    if (moving.has(to.parentId)) return null
+    if (ancestorsOf(items, to.parentId).some((g) => moving.has(g.id))) return null
+  }
+
+  // Movers keep their relative stacking, whatever order the selection is in.
+  const order = new Map<string, number>()
+  let n = 0
+  walkItems(items, (it) => order.set(it.id, n++))
+  const picked = top
+    .slice()
+    .sort((a, b) => (order.get(a) ?? 0) - (order.get(b) ?? 0))
+    .map((id) => findItem(items, id))
+    .filter((it): it is DocItem => it !== null)
+  if (picked.length === 0) return null
+
+  const siblings = to.parentId === null ? items : (findItem(items, to.parentId) as GroupItem).children
+  const shift = siblings.filter((c, i) => i < to.index && moving.has(c.id)).length
+  const next = insertItems(removeItems(items, moving), to.parentId, to.index - shift, picked)
+  return treeSig(next) === treeSig(items) ? null : next
+}
+
+/** Ids in tree order with their depth — enough to tell "nothing moved". */
+function treeSig(items: readonly DocItem[]): string {
+  const parts: string[] = []
+  walkItems(items, (it, depth) => parts.push(`${depth}:${it.id}`))
+  return parts.join('|')
+}
+
+/** Selected ids with any that are nested inside another selected id dropped. */
+export function topLevelSelection(items: readonly DocItem[], ids: ReadonlySet<string>): string[] {
+  return [...ids].filter((id) => !ancestorsOf(items, id).some((g) => ids.has(g.id)))
+}
+
+/**
+ * Move the selection one step through paint order within its own parent, or all
+ * the way to an end. Each id moves inside the group it already lives in — a
+ * raise must not teleport an item out of its folder.
+ */
+export function reorderItems(
+  items: readonly DocItem[],
+  ids: ReadonlySet<string>,
+  how: 'front' | 'back' | 'forward' | 'backward',
+): DocItem[] {
+  const reorderList = (list: readonly DocItem[]): DocItem[] => {
+    const sel = list.map((it, i) => (ids.has(it.id) ? i : -1)).filter((i) => i >= 0)
+    let out = list.map((it) => (isGroup(it) ? withChildren(it, reorderList(it.children)) : it))
+    if (sel.length === 0) return sameOrShared(list, out)
+
+    const picked = sel.map((i) => out[i])
+    const rest = out.filter((_, i) => !sel.includes(i))
+    if (how === 'front') out = [...rest, ...picked]
+    else if (how === 'back') out = [...picked, ...rest]
+    else {
+      // One step, processed from the edge the items are travelling toward so a
+      // contiguous run slides as a block instead of collapsing onto itself.
+      out = [...out]
+      const step = how === 'forward' ? 1 : -1
+      const order = how === 'forward' ? [...sel].reverse() : sel
+      for (const i of order) {
+        const j = i + step
+        if (j < 0 || j >= out.length || ids.has(out[j].id)) continue
+        ;[out[i], out[j]] = [out[j], out[i]]
+      }
+    }
+    return out
+  }
+  return reorderList(items)
+}
+
+function withChildren(g: GroupItem, children: DocItem[]): GroupItem {
+  return children === g.children ? g : { ...g, children }
+}
+
+function sameOrShared(orig: readonly DocItem[], next: DocItem[]): DocItem[] {
+  return next.every((it, i) => it === orig[i]) ? (orig as DocItem[]) : next
+}
+
+/** Convenience: the doc with a new item list. */
+export function withItems(doc: EditableDoc, items: DocItem[]): EditableDoc {
+  return items === doc.items ? doc : { ...doc, items }
+}

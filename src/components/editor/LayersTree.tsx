@@ -1,0 +1,464 @@
+// The layers rail: the document tree, top of the list = top of the stack.
+//
+// The row model (order, indent, what shift-click spans, where a drop lands)
+// lives in `lib/editor/layerRows.ts`; this file handles pointer input and
+// rendering. Reordering drags from the grip at a row's left, so the rest of the
+// row stays a click target for selection and double-click renaming.
+
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { ChevronDown, ChevronRight, Eye, EyeOff, Folder, GripVertical, Lock, Square, Trash2, Type } from '../ui/icons'
+import type { DocItem, EditableDoc, PathItem } from '../../lib/path/types'
+import { isGroup } from '../../lib/path/docTree'
+import { dropSpot, edgeAt, layerRows, rowsBetween, type DropEdge, type DropSpot } from '../../lib/editor/layerRows'
+import { itemLabel } from './editorDoc'
+import { PathView } from '../vector/DocRender'
+import { itemBox } from '../../lib/editor/transform'
+import { TipLabel, Tooltip } from '../ui/Tooltip'
+
+export interface LayersTreeProps {
+  doc: EditableDoc
+  selection: ReadonlySet<string>
+  /** The whole next selection — the rail resolves plain / toggle / range itself. */
+  onSelect: (ids: ReadonlySet<string>) => void
+  onToggleVisible: (id: string) => void
+  onToggleExpanded: (id: string) => void
+  onRename: (id: string, name: string) => void
+  onDelete: (id: string) => void
+  /** Drop `ids` at a paint-order insertion point. */
+  onMove: (ids: ReadonlySet<string>, to: DropSpot) => void
+  /** The item the canvas pointer is over: its row lights up as if hovered. */
+  hoverId: string | null
+  /** The row under the pointer, for the canvas to echo (null on leave). */
+  onHover: (id: string | null) => void
+  /** Right-click on a row (already selected by then); `rename` opens the row's name field. */
+  onRowMenu: (id: string, at: { x: number; y: number }, rename: () => void) => void
+}
+
+interface DragState {
+  ids: ReadonlySet<string>
+  over: { rowId: string; edge: DropEdge } | null
+}
+
+/** How close to the rail's edge a drag has to get before the list scrolls. */
+const EDGE_PX = 28
+const EDGE_SPEED = 9
+
+export const LayersTree = memo(function LayersTree(props: LayersTreeProps) {
+  const rows = useMemo(() => layerRows(props.doc.items), [props.doc.items])
+  const rowsRef = useRef(rows)
+  rowsRef.current = rows
+
+  const [drag, setDrag] = useState<DragState | null>(null)
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const dragRef = useRef<DragState | null>(null)
+  const anchorRef = useRef<string | null>(null)
+  const rootRef = useRef<HTMLDivElement | null>(null)
+  const scrollerRef = useRef<HTMLElement | null>(null)
+  const stopRef = useRef<(() => void) | null>(null)
+  const velRef = useRef(0)
+  const dragging = drag !== null
+
+  // The live props, for handlers that outlive the render that made them.
+  const propsRef = useRef(props)
+  propsRef.current = props
+
+  const setDragState = (next: DragState | null) => {
+    dragRef.current = next
+    setDrag(next)
+  }
+
+  useEffect(() => () => stopRef.current?.(), [])
+
+  /* ----------------------------------------------------------- selection */
+
+  // Row handlers are identity-stable (they read `propsRef`) so `LayerRowView`
+  // stays memoized; otherwise every row and its thumbnail re-renders on each
+  // document change, which makes colour scrubbing slow on traced documents.
+  const clickRow = useCallback((id: string, e: React.PointerEvent) => {
+    const p = propsRef.current
+    if (e.shiftKey && anchorRef.current) {
+      // The anchor survives a range click, so repeated shift-clicks re-span
+      // from the same origin.
+      p.onSelect(new Set(rowsBetween(rowsRef.current, anchorRef.current, id)))
+      return
+    }
+    anchorRef.current = id
+    if (e.metaKey || e.ctrlKey) {
+      const next = new Set(p.selection)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      p.onSelect(next)
+      return
+    }
+    p.onSelect(new Set([id]))
+  }, [])
+
+  const toggleVisible = useCallback((id: string) => propsRef.current.onToggleVisible(id), [])
+  const toggleExpanded = useCallback((id: string) => propsRef.current.onToggleExpanded(id), [])
+  const rename = useCallback((id: string, name: string) => propsRef.current.onRename(id, name), [])
+  const remove = useCallback((id: string) => propsRef.current.onDelete(id), [])
+  const hover = useCallback((id: string | null) => propsRef.current.onHover(id), [])
+  const menu = useCallback((id: string, e: React.MouseEvent) => {
+    e.preventDefault()
+    const p = propsRef.current
+    // Like the canvas: a right-click on an unselected row selects it, one on the selection keeps it whole.
+    if (!p.selection.has(id)) {
+      anchorRef.current = id
+      p.onSelect(new Set([id]))
+    }
+    p.onRowMenu(id, { x: e.clientX, y: e.clientY }, () => setEditingId(id))
+  }, [])
+
+  /* ---------------------------------------------------------------- drag */
+
+  const endDrag = (drop: boolean) => {
+    const state = dragRef.current
+    velRef.current = 0
+    stopRef.current?.()
+    stopRef.current = null
+    setDragState(null)
+    if (!drop || !state?.over) return
+    const to = dropSpot(rowsRef.current, state.over.rowId, state.over.edge)
+    if (to) propsRef.current.onMove(state.ids, to)
+  }
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies(endDrag): only touches refs and state setters
+  // biome-ignore lint/correctness/useExhaustiveDependencies(setDragState): only touches refs and state setters
+  const startDrag = useCallback((id: string, e: React.PointerEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    const selection = propsRef.current.selection
+    // Dragging an unselected row drags just it; gripping one of several
+    // selected rows takes the whole set along.
+    const ids: ReadonlySet<string> = selection.has(id) ? new Set(selection) : new Set([id])
+    if (!selection.has(id)) {
+      anchorRef.current = id
+      propsRef.current.onSelect(ids)
+    }
+    scrollerRef.current = scrollParent(rootRef.current)
+    setDragState({ ids, over: null })
+
+    const onMove = (ev: PointerEvent) => {
+      const state = dragRef.current
+      if (!state) return
+      const el = document.elementFromPoint(ev.clientX, ev.clientY) as HTMLElement | null
+      const rowEl = el?.closest<HTMLElement>('[data-layer-row]')
+      const rowId = rowEl?.dataset.layerRow
+      if (rowEl && rowId) {
+        const box = rowEl.getBoundingClientRect()
+        const row = rowsRef.current.find((r) => r.item.id === rowId)
+        const edge = edgeAt(ev.clientY - box.top, box.height, row ? isGroup(row.item) : false)
+        if (state.over?.rowId !== rowId || state.over.edge !== edge) {
+          setDragState({ ...state, over: { rowId, edge } })
+        }
+      } else if (state.over) {
+        setDragState({ ...state, over: null })
+      }
+
+      // Auto-scroll near the edge, so rows outside the visible rail are reachable.
+      const sc = scrollerRef.current
+      if (!sc) return
+      const b = sc.getBoundingClientRect()
+      velRef.current = ev.clientY < b.top + EDGE_PX ? -EDGE_SPEED : ev.clientY > b.bottom - EDGE_PX ? EDGE_SPEED : 0
+    }
+    const onUp = () => endDrag(true)
+    const onCancel = () => endDrag(false)
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key !== 'Escape') return
+      ev.stopPropagation()
+      endDrag(false)
+    }
+
+    // Bound here rather than in an effect on `dragging`: an effect runs after
+    // the re-render, and a fast drag may have missed its first pointermoves.
+    let raf = requestAnimationFrame(function tick() {
+      if (velRef.current !== 0) scrollerRef.current?.scrollBy(0, velRef.current)
+      raf = requestAnimationFrame(tick)
+    })
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+    window.addEventListener('pointercancel', onCancel)
+    window.addEventListener('keydown', onKey, true)
+    stopRef.current = () => {
+      cancelAnimationFrame(raf)
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointercancel', onCancel)
+      window.removeEventListener('keydown', onKey, true)
+    }
+  }, [])
+
+  /* -------------------------------------------------------------- render */
+
+  if (rows.length === 0) {
+    return (
+      <p className="px-3 py-6 text-center text-xs text-faint">
+        Nothing here yet. Draw a shape, or drop an SVG onto the canvas.
+      </p>
+    )
+  }
+
+  return (
+    <div
+      ref={rootRef}
+      onPointerLeave={() => hover(null)}
+      className={`flex flex-col gap-px py-1 ${dragging ? 'cursor-grabbing' : ''}`}
+    >
+      {rows.map((row) => (
+        <LayerRowView
+          key={row.item.id}
+          item={row.item}
+          depth={row.depth}
+          number={row.number}
+          selected={props.selection.has(row.item.id)}
+          hovered={props.hoverId === row.item.id}
+          editing={editingId === row.item.id}
+          onEditing={setEditingId}
+          onHover={hover}
+          onMenu={menu}
+          dragging={drag?.ids.has(row.item.id) ?? false}
+          over={drag?.over?.rowId === row.item.id ? drag.over.edge : null}
+          onPick={clickRow}
+          onGrip={startDrag}
+          onToggleVisible={toggleVisible}
+          onToggleExpanded={toggleExpanded}
+          onRename={rename}
+          onDelete={remove}
+        />
+      ))}
+    </div>
+  )
+})
+
+/**
+ * One row. Memoized on flat props rather than the `LayerRow` object, because
+ * `layerRows` mints fresh row objects on every document change.
+ */
+const LayerRowView = memo(function LayerRowView({
+  item,
+  depth,
+  number,
+  selected,
+  hovered,
+  editing,
+  onEditing,
+  onHover,
+  onMenu,
+  dragging,
+  over,
+  onPick,
+  onGrip,
+  onToggleVisible,
+  onToggleExpanded,
+  onRename,
+  onDelete,
+}: {
+  item: DocItem
+  depth: number
+  number: number
+  selected: boolean
+  hovered: boolean
+  editing: boolean
+  onEditing: (id: string | null) => void
+  onHover: (id: string | null) => void
+  onMenu: (id: string, e: React.MouseEvent) => void
+  dragging: boolean
+  over: DropEdge | null
+  onPick: (id: string, e: React.PointerEvent) => void
+  onGrip: (id: string, e: React.PointerEvent) => void
+  onToggleVisible: (id: string) => void
+  onToggleExpanded: (id: string) => void
+  onRename: (id: string, name: string) => void
+  onDelete: (id: string) => void
+}) {
+  const inputRef = useRef<HTMLInputElement | null>(null)
+  const text = isGroup(item) && !!item.text
+  // A text is one layer, not a folder of glyphs.
+  const group = isGroup(item) && !text
+
+  useEffect(() => {
+    if (editing) inputRef.current?.select()
+  }, [editing])
+
+  const label = itemLabel(item, number)
+
+  const commitName = () => {
+    onEditing(null)
+    onRename(item.id, inputRef.current?.value ?? '')
+  }
+
+  return (
+    <div
+      data-layer-row={item.id}
+      onPointerDown={(e) => {
+        // Only the main button selects: a right-click's pointerdown would
+        // collapse a multi-selection before its menu opened on it.
+        if (editing || e.button !== 0) return
+        onPick(item.id, e)
+      }}
+      onDoubleClick={() => onEditing(item.id)}
+      onPointerEnter={() => onHover(item.id)}
+      onContextMenu={(e) => {
+        if (!editing) onMenu(item.id, e)
+      }}
+      className={`group relative flex h-8 shrink-0 cursor-default items-center gap-1 rounded-md pr-1 text-xs transition-colors ${
+        selected ? 'bg-accent-soft text-accent' : `text-ink-2 hover:bg-surface-3 ${hovered ? 'bg-surface-3' : ''}`
+      } ${dragging ? 'opacity-40' : ''} ${over === 'into' ? 'ring-1 ring-accent' : ''}`}
+      style={{ paddingLeft: depth * 12 }}
+    >
+      {over === 'above' && <DropLine side="top" depth={depth} />}
+      {over === 'below' && <DropLine side="bottom" depth={depth} />}
+
+      <Tooltip
+        label={
+          <TipLabel title="Drag to reorder" detail="Drop between rows to restack, or onto a group to move it inside." />
+        }
+      >
+        <button
+          type="button"
+          aria-label="Reorder layer"
+          onPointerDown={(e) => onGrip(item.id, e)}
+          className="flex h-6 w-3.5 shrink-0 cursor-grab items-center justify-center text-faint opacity-0 hover:text-ink group-hover:opacity-100"
+        >
+          <GripVertical size={12} />
+        </button>
+      </Tooltip>
+
+      {group ? (
+        <Tooltip
+          label={
+            <TipLabel
+              title={item.expanded === false ? 'Expand group' : 'Collapse group'}
+              detail="Only changes what this list shows. The artwork stays as it is."
+            />
+          }
+        >
+          <button
+            type="button"
+            onPointerDown={(e) => {
+              e.stopPropagation()
+              onToggleExpanded(item.id)
+            }}
+            className="flex h-4 w-4 shrink-0 items-center justify-center text-faint hover:text-ink"
+            aria-label={item.expanded === false ? 'Expand group' : 'Collapse group'}
+          >
+            {item.expanded === false ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
+          </button>
+        </Tooltip>
+      ) : (
+        <span className="w-4 shrink-0" />
+      )}
+
+      <span className="flex h-5 w-5 shrink-0 items-center justify-center">
+        {text ? (
+          <Type size={13} className="text-faint" />
+        ) : group ? (
+          <Folder size={13} className="text-faint" />
+        ) : item.kind === 'path' ? (
+          <LayerThumb item={item} />
+        ) : (
+          <Lock size={12} className="text-faint" />
+        )}
+      </span>
+
+      {editing ? (
+        <input
+          ref={inputRef}
+          defaultValue={label}
+          onBlur={commitName}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') commitName()
+            if (e.key === 'Escape') onEditing(null)
+            e.stopPropagation()
+          }}
+          className="min-w-0 flex-1 rounded border border-line bg-surface px-1 py-0.5 text-xs text-ink outline-none"
+        />
+      ) : (
+        <span className="min-w-0 flex-1 truncate">{label}</span>
+      )}
+
+      <Tooltip
+        label={
+          <TipLabel
+            title={item.visible ? 'Hide layer' : 'Show layer'}
+            detail="Hidden layers stay in the file but are left out of the export."
+          />
+        }
+      >
+        <button
+          type="button"
+          onPointerDown={(e) => {
+            e.stopPropagation()
+            onToggleVisible(item.id)
+          }}
+          className={`flex h-6 w-6 shrink-0 items-center justify-center rounded text-faint hover:text-ink ${
+            item.visible ? 'opacity-0 group-hover:opacity-100' : 'opacity-100'
+          }`}
+        >
+          {item.visible ? <Eye size={13} /> : <EyeOff size={13} />}
+        </button>
+      </Tooltip>
+      <Tooltip label={<TipLabel title="Delete layer" detail="Removes it from the drawing. Ctrl+Z brings it back." />}>
+        <button
+          type="button"
+          onPointerDown={(e) => {
+            e.stopPropagation()
+            onDelete(item.id)
+          }}
+          className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-faint opacity-0 hover:text-bad group-hover:opacity-100"
+        >
+          <Trash2 size={13} />
+        </button>
+      </Tooltip>
+    </div>
+  )
+})
+
+/** The 2px rule that says where the drop lands, indented to the target depth. */
+function DropLine({ side, depth }: { side: 'top' | 'bottom'; depth: number }) {
+  return (
+    <span
+      aria-hidden
+      className={`pointer-events-none absolute right-1 h-0.5 rounded-full bg-accent ${
+        side === 'top' ? '-top-px' : '-bottom-px'
+      }`}
+      style={{ left: depth * 12 + 4 }}
+    />
+  )
+}
+
+/** The nearest scrollable ancestor — what a drag near the edge has to nudge. */
+function scrollParent(el: HTMLElement | null): HTMLElement | null {
+  for (let node = el?.parentElement ?? null; node; node = node.parentElement) {
+    const oy = getComputedStyle(node).overflowY
+    if ((oy === 'auto' || oy === 'scroll') && node.scrollHeight > node.clientHeight) return node
+  }
+  return null
+}
+
+/**
+ * A 16px thumbnail of the path's geometry (the path data is already cached).
+ */
+function LayerThumb({ item }: { item: PathItem }) {
+  const box = itemBox(item)
+  if (!box || box.w === 0 || box.h === 0) {
+    return <Square size={12} style={{ color: item.fill }} />
+  }
+  // `itemBox` is the geometry box and stops at a stroke's centreline, so pad
+  // by half the stroke width to avoid clipping it.
+  const pad = Math.max(box.w, box.h) * 0.06 + (item.stroke?.width ?? 0) / 2
+  return (
+    // Checkerboard rather than white, so white artwork stays visible.
+    <svg
+      width={16}
+      height={16}
+      viewBox={`${box.x - pad} ${box.y - pad} ${box.w + pad * 2} ${box.h + pad * 2}`}
+      className="checkerboard rounded-[3px] ring-1 ring-line"
+      aria-hidden
+    >
+      {/* The shared renderer, with its own gradient-id scope so its defs don't
+          collide with the canvas's. */}
+      <PathView item={item} scope={`thumb-${item.id}`} />
+    </svg>
+  )
+}

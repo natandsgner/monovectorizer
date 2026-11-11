@@ -1,0 +1,287 @@
+// `logolab install` — register this server with the agent you use.
+//
+// Every client stores the same three facts (a name, a command, its arguments) in
+// a different file, so this writes the right shape into the right place and
+// leaves everything else in that file untouched.
+//
+//   logolab install                     → .mcp.json here (Claude Code, project scope)
+//   logolab install --client cursor     → .cursor/mcp.json
+//   logolab install --client vscode     → .vscode/mcp.json
+//   logolab install --scope user        → the client's user-level config
+//                                         (VS Code: <profile>/Code/User/mcp.json)
+//   logolab install --client print      → print the JSON, change nothing
+//   logolab install --skill             → .claude/skills/logolab/SKILL.md (no server:
+//                                         the skill runs `logolab call` itself)
+//   logolab install --skills-dir <dir>  → <dir>/logolab/SKILL.md, for any agent
+//                                         that reads Agent Skills from a folder
+//
+// The config it writes must match how it was run, or the client would launch a
+// copy the user never chose: from a checkout it writes the path to
+// `src/mcp/server.ts`, from the published package `npx -y logolab`. See
+// `launchSpec`.
+
+import { spawnSync } from 'node:child_process'
+import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { ensureParent, projectRoot, resolvePath, runningFromSource } from './runtime.ts'
+import { SKILL_CLI, SKILL_MD } from './skill.ts'
+
+export type InstallClient = 'claude' | 'cursor' | 'vscode' | 'print'
+export type InstallScope = 'project' | 'user'
+
+export interface InstallOptions {
+  client: InstallClient
+  scope: InstallScope
+  /** The project to install into (project scope). Defaults to the CWD. */
+  dir: string
+  /** Server name as the client will show it. */
+  name: string
+  /** Install the agent SKILL (`skill.ts`) instead of registering the server. */
+  skill?: boolean
+  /** With `skill`: the skills folder to write into, for an agent other than Claude Code. */
+  skillsDir?: string
+}
+
+/** The package name on npm. `npx -y <this>` is the install everyone else uses. */
+export const PACKAGE_NAME = 'logolab'
+
+/** Absolute path to this server's entry point in a checkout (`''` when published). */
+export function serverEntry(): string {
+  return runningFromSource() ? join(projectRoot(), 'src', 'mcp', 'server.ts') : ''
+}
+
+/**
+ * The stdio launch command every client config is a wrapper around.
+ *
+ * Published, that is `npx -y logolab`: no clone, no path, and the `-y` skips the
+ * prompt npx would otherwise block on with no TTY to answer it.
+ *
+ * From a checkout it is the path to the entry point, so a contributor's client
+ * runs their working tree instead of silently downloading the release. Plain
+ * `node`, not `process.execPath`: a version manager moves the absolute path out
+ * from under the config, and every client resolves `node` on PATH the way a
+ * shell does.
+ *
+ * On native Windows the published command goes through `cmd /c`: `npx` there is
+ * `npx.cmd`, a batch shim, and a client that spawns without a shell (Claude Code
+ * does) gets ENOENT for a bare `npx`. `node` is a real `node.exe`, so the
+ * checkout spec needs no wrapper.
+ */
+export function launchSpec(
+  platform: NodeJS.Platform = process.platform,
+  fromSource: boolean = runningFromSource(),
+): { command: string; args: string[] } {
+  if (fromSource) return { command: 'node', args: [serverEntry()] }
+  return platform === 'win32'
+    ? { command: 'cmd', args: ['/c', 'npx', '-y', PACKAGE_NAME] }
+    : { command: 'npx', args: ['-y', PACKAGE_NAME] }
+}
+
+/** Claude Code / Cursor shape. */
+function mcpServersEntry(name: string): Record<string, unknown> {
+  const { command, args } = launchSpec()
+  return { [name]: { command, args } }
+}
+
+/** VS Code shape (`servers`, and it wants the transport named). */
+function vscodeEntry(name: string): Record<string, unknown> {
+  const { command, args } = launchSpec()
+  return { [name]: { type: 'stdio', command, args } }
+}
+
+function readJson(file: string): Record<string, unknown> {
+  if (!existsSync(file)) return {}
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8')) as unknown
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {}
+  } catch (err) {
+    throw new Error(`${file} is not valid JSON, so it was left alone: ${(err as Error).message}`)
+  }
+}
+
+/** Merge one server into `key` of a JSON config, preserving everything else. */
+function mergeInto(file: string, key: string, entry: Record<string, unknown>): { file: string; replaced: boolean } {
+  const config = readJson(file)
+  const bucket = (config[key] && typeof config[key] === 'object' ? config[key] : {}) as Record<string, unknown>
+  const name = Object.keys(entry)[0]
+  const replaced = name in bucket
+  config[key] = { ...bucket, ...entry }
+  writeFileSync(ensureParent(file), JSON.stringify(config, null, 2) + '\n')
+  return { file, replaced }
+}
+
+/**
+ * VS Code's user-level MCP config: `mcp.json` in the profile's User folder (what
+ * "MCP: Open User Configuration" opens). Not `~/.vscode`, which holds extensions
+ * and is never read for it.
+ */
+export function vscodeUserDir(
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+  home: string = homedir(),
+): string {
+  if (platform === 'win32') return join(env.APPDATA || join(home, 'AppData', 'Roaming'), 'Code', 'User')
+  if (platform === 'darwin') return join(home, 'Library', 'Application Support', 'Code', 'User')
+  return join(env.XDG_CONFIG_HOME || join(home, '.config'), 'Code', 'User')
+}
+
+/** Where each client keeps its config. */
+export function configPath(client: InstallClient, scope: InstallScope, dir: string): string {
+  const home = homedir()
+  if (client === 'claude') return scope === 'user' ? join(home, '.claude.json') : join(dir, '.mcp.json')
+  if (client === 'cursor')
+    return scope === 'user' ? join(home, '.cursor', 'mcp.json') : join(dir, '.cursor', 'mcp.json')
+  return scope === 'user' ? join(vscodeUserDir(), 'mcp.json') : join(dir, '.vscode', 'mcp.json')
+}
+
+export interface InstallResult {
+  client: InstallClient
+  file: string | null
+  replaced: boolean
+  /** What to tell the user afterwards. */
+  message: string
+}
+
+/**
+ * User-scope Claude Code config lives in `~/.claude.json`, the CLI's own state
+ * file, which a running session may be writing. Don't rewrite it from here: ask
+ * the CLI to add the server, and fall back to the file only when there is no CLI.
+ */
+function claudeCliAdd(name: string, command: string, args: string[]): boolean {
+  const run = (bin: string) =>
+    spawnSync(bin, ['mcp', 'add', '--scope', 'user', name, '--', command, ...args], {
+      stdio: 'ignore',
+      // `claude` is a .cmd shim on Windows, which needs the shell to resolve.
+      shell: process.platform === 'win32',
+    })
+  for (const bin of ['claude']) {
+    const result = run(bin)
+    if (!result.error && result.status === 0) return true
+  }
+  return false
+}
+
+/** Where `install --skill` writes SKILL.md: `<skills folder>/logolab/SKILL.md`. */
+export function skillPath(scope: InstallScope, dir: string, skillsDir?: string): string {
+  const root = skillsDir
+    ? resolvePath(skillsDir)
+    : scope === 'user'
+      ? join(homedir(), '.claude', 'skills')
+      : join(dir, '.claude', 'skills')
+  return join(root, 'logolab', 'SKILL.md')
+}
+
+function installSkill(opts: InstallOptions): InstallResult {
+  const file = skillPath(opts.scope, resolvePath(opts.dir), opts.skillsDir)
+  const replaced = existsSync(file)
+  writeFileSync(ensureParent(file), SKILL_MD)
+  const where = opts.skillsDir
+    ? 'Point your agent at that folder if it does not already read it.'
+    : opts.scope === 'user'
+      ? 'Claude Code picks it up in every project; restart a running session.'
+      : 'Claude Code picks it up in this project; restart a running session.'
+  return {
+    client: opts.client,
+    file,
+    replaced,
+    message: `${replaced ? 'Updated' : 'Added'} the logolab skill in ${file}. ${where} It runs \`${SKILL_CLI} call …\` — no MCP server needed.`,
+  }
+}
+
+export function install(opts: InstallOptions): InstallResult {
+  if (opts.skill || opts.skillsDir) return installSkill(opts)
+  const { client, scope, name } = opts
+  const dir = resolvePath(opts.dir)
+  const { command, args } = launchSpec()
+
+  if (client === 'print') {
+    const snippet = JSON.stringify({ mcpServers: mcpServersEntry(name) }, null, 2)
+    return {
+      client,
+      file: null,
+      replaced: false,
+      message: [
+        'Nothing was written. Add this to your client config:',
+        '',
+        snippet,
+        '',
+        'Claude Code:  ' + `claude mcp add ${name} -- ${command} ${args.join(' ')}`,
+        'VS Code:      ' + `code --add-mcp "${JSON.stringify({ name, command, args }).replace(/"/g, '\\"')}"`,
+      ].join('\n'),
+    }
+  }
+
+  if (client === 'claude' && scope === 'user' && claudeCliAdd(name, command, args)) {
+    return {
+      client,
+      file: null,
+      replaced: false,
+      message: `Added "${name}" for every project via \`claude mcp add --scope user\`. Restart Claude Code.`,
+    }
+  }
+
+  const file = configPath(client, scope, dir)
+  const key = client === 'vscode' ? 'servers' : 'mcpServers'
+  const entry = client === 'vscode' ? vscodeEntry(name) : mcpServersEntry(name)
+  const result = mergeInto(file, key, entry)
+
+  const restart =
+    client === 'claude'
+      ? scope === 'project'
+        ? 'Restart Claude Code in this directory; it will ask you to approve the project server once.'
+        : 'Restart Claude Code — the server is now on for every project.'
+      : client === 'cursor'
+        ? 'Reload Cursor (or toggle the server in Settings → MCP).'
+        : 'Reload VS Code; the server appears under MCP servers.'
+
+  return {
+    client,
+    file: result.file,
+    replaced: result.replaced,
+    message: `${result.replaced ? 'Updated' : 'Added'} "${name}" in ${result.file}. ${restart}`,
+  }
+}
+
+/** Parse `install` CLI flags. */
+export function parseInstallArgs(argv: string[]): InstallOptions {
+  const flag = (n: string): string | undefined => {
+    const i = argv.indexOf(`--${n}`)
+    return i >= 0 ? argv[i + 1] : undefined
+  }
+  const client = (flag('client') ?? 'claude') as InstallClient
+  if (!['claude', 'cursor', 'vscode', 'print'].includes(client)) {
+    throw new Error(`--client must be claude, cursor, vscode or print (got "${client}")`)
+  }
+  const scope = (flag('scope') ?? 'project') as InstallScope
+  if (!['project', 'user'].includes(scope)) throw new Error(`--scope must be project or user (got "${scope}")`)
+  return {
+    client,
+    scope,
+    dir: flag('dir') ?? process.cwd(),
+    name: flag('name') ?? 'logolab',
+    skill: argv.includes('--skill'),
+    skillsDir: flag('skills-dir'),
+  }
+}
+
+/**
+ * True when this module was run directly, not imported.
+ *
+ * Both sides go through `realpath` because an npm `bin` is a symlink: argv[1] is
+ * the link while `import.meta.url` is the resolved target. Compared raw, an
+ * npx-launched server decides it was imported and exits without serving.
+ */
+export function isMain(url: string): boolean {
+  const invoked = process.argv[1]
+  if (invoked == null) return false
+  const real = (p: string): string => {
+    try {
+      return realpathSync(p)
+    } catch {
+      return p
+    }
+  }
+  return real(fileURLToPath(url)) === real(resolvePath(invoked))
+}

@@ -1,0 +1,877 @@
+# LogoLab — working notes for agents
+
+Drop in a logo → preview in context → **vectorize** to clean SVG → export PWA icons. The
+vectorizer (raster → planar shared-edge trace) is the heart of the app: `src/lib/trace/`. It
+is also the npm package **`logolab`** — the same tracer as an MCP server — so read *The tracer
+ships TWICE* below before you call a change to it done.
+
+## Before ANY vectorizer change: freeze an A/B snapshot
+
+A change to the tracer (`src/lib/trace/**`, segmentation, beautify, fit) can silently move the
+output on cases you weren't looking at. So **before** you start, freeze a baseline:
+
+```
+pnpm gen:absnapshot before-<what>     # e.g. before-checker
+```
+
+Then make the change and open **`/labs/ab`** → pick your baseline in the **Baseline**
+dropdown → **Changed only** shows exactly which cases moved, and each gets a **diff heat**
+panel showing *where*. This is how you catch collateral changes (a corner-veto for `checker`
+also nudged `aa-seam`'s flat trace — only the A/B view revealed it).
+
+If you also freeze an `after-<what>` stamp when the change is accepted, the two are a **pair**:
+they show up in the Baseline dropdown under **⇄ Pairs** as one entry that diffs the two FROZEN
+stamps against each other (nothing traced, so it does not decay as you keep working, and the
+`after-` stamp is not dead weight). **Compare with** is the same control by hand — working tree
+(the default) or any other snapshot. Don't stamp an `after-` unless you mean to keep it: a lone
+`before-` is the normal case, and the pair is for a result worth being able to re-open later.
+
+Every case is traced in **three lanes** (`AB_LANES`), each at the resolution production uses
+for that art: flat at the flat cap, gradient/photo at the gradient cap, and **mono** — its own
+segmentation (`src/lib/trace/mono.ts`: the ink cut as a two-label map) through the SAME
+planar fitter as the colour lanes, so a fitter change shows in all three and a cut change in
+mono alone. The mono cut comes from the ink probe on the raster, not a constant, so the lane
+traces what a user actually gets. Old stamps keep working: every lane's resolution is
+recorded per stamp.
+
+Two case lanes, both in `bench/abCorpus.ts`: the ⟐ **fixtures** (handcrafted, one mechanism
+each — good gates, weak evidence: they are "good enough" long before real art is) and a slice
+of the ◆ **gallery** corpus, the same brand marks `/labs/gallery` shows, rasterized on white
+exactly as that page does. The gallery lane needs `npm run fetch:logos`; without it the lane
+is empty and everything else still works. `--logos all|a,b|none` overrides the slice for one
+run. Judge a tracer change on BOTH — the defects get reported on the marks.
+
+Snapshots live in `test/ab-snapshots/<name>/`, several coexist, and they are **gitignored**:
+a stamp is a local working artifact (regenerable from any revision), and the gallery lane
+traces trademarked art that is not redistributed. Re-bless (`pnpm gen:absnapshot <name>`)
+once a change is accepted.
+
+## Verifying tracer correctness (not just "did it change")
+
+`/labs/ab` tells you output *changed*; the **truth gate** tells you if it's *wrong*. It scores
+the trace against the AUTHORED SVG (geometry, not a blessed baseline), so an improvement just
+moves further inside the limits — nothing needs re-blessing.
+
+```
+node --test test/truth-gate.test.ts
+```
+
+Gates: boundary chamfer/p95, node parsimony, region recovery, **corner recovery** (a
+distance-blind topology check — catches a shape rounded while every px stays sub-tolerance,
+e.g. a checker cell melted to a blob), its two precision halves — **corners invented** (a
+60° kink the art does not have) and **tangent breaks** (a kink of ANY size, from 5°, on
+boundary the art draws smooth: a rounded rect whose sides meet its corners at 15° has no
+"invented corner" and is still not the shape that was drawn, §42) — and **paint fidelity**
+(gradient tier 0 only: the trace is RENDERED and scored in ΔE against the source raster —
+catches a paint-only failure like a re-centred glow, which every geometry gate is blind to
+on gradient art, §10.3).
+Open defects + the method are tracked in ONE place:
+**`docs/vectorization-benchmarks.md` §0**, with `KNOWN_DEFECTS` in the test as the
+machine-checked status. A case not in `KNOWN_DEFECTS` must pass every applicable gate.
+
+## The scorer is in the PRODUCT now, and the number and the picture are one field
+
+The studio's status bar carries a **ΔE** readout and there is a fifth view mode,
+**Difference**, painting per-pixel ΔE on the same cold→hot ramp `/labs/ab` diffs two
+traces with. That has two consequences for anything you touch here:
+
+* **`fidelity()` is shipped code.** It lives in `src/lib/render/fidelity.ts`;
+  `bench/metrics.ts` re-exports it (like `bench/raster.ts` shims the
+  rasterizer). "1.8 ΔE" in the status bar and "1.8 ΔE" in the benchmark table have to be
+  the same claim, so do NOT give the app its own copy of the ΔE math — take
+  `deltaEField` / `deltaEStats`, which is the half `fidelity()` itself is built on.
+  `src/lib/heat.ts` is the ramp, moved out of `components/labs/` for the same reason.
+* **One `deltaEField` call answers both questions**, in one worker message
+  (`src/lib/render/fidelity.worker.ts`). Compute the heat separately and the bar and the
+  picture can describe the same trace differently — which is the one failure mode a
+  screenshot cannot show you.
+* **The picture is the heat over a GHOST, and the ghost is not a second measurement.**
+  `src/lib/render/diffView.ts` lays the heat over a dim greyscale ghost of the source
+  (so a hot spot has a place on the art, and a right trace shows the art instead of a
+  black square) and reads the field back under the cursor (coordinates, the two colours
+  that were compared, their ΔE). From `HEAT_OPAQUE_DE` up the picture IS the heat byte
+  for byte; below it the heat fades into the ghost in proportion to the SAME `de` the
+  numbers came from. The worker returns `de`, `render` and `source` alongside the heat
+  for exactly this — the pane paints buffers, it measures nothing. The canvas goes
+  `pixelated` once a heat pixel is wider than a screen pixel, because a diff is inspected
+  at 5× and a bilinear smear of a one-pixel seam is the one thing it must not show.
+  `test/diff-view.test.ts` is the gate.
+
+Three things the score gets right that are easy to undo:
+
+* **It measures against the source WITH ITS ALPHA**, composited over white inside the
+  metric. Decode the source onto white instead and art on transparency scores as a
+  catastrophically wrong trace (the truth gate and the labs' fixture lane differ on
+  exactly this point — see `docs/vectorization-benchmarks.md`).
+* **It scores `derivedDoc`** — force-colour and all — because that is the document every
+  other number in that bar describes.
+* **It scores at 1024px via `rasterizeDoc`'s `scale`**, not at trace resolution. The
+  compositor is O(w·h) PER PATH, so a 4096 high-detail trace would be seconds of work for
+  a three-digit number; halving the resolution moves the mean by ~0.005 ΔE. `scale` also
+  divides the Bézier flattening tolerance, so the chord error stays sub-pixel in OUTPUT
+  space — without that a cleaned SVG (viewBox 24 units) renders as a visible polygon and
+  the score blames the tracer for the renderer. `test/fidelity.test.ts` is the gate.
+
+## A small mono raster is ENLARGED before it is traced, and the mono cut is a COVERAGE cut
+
+Two rules in `src/lib/traceInput/traceCaps.ts`, next to the raster cap, decide how many pixels a mono
+trace gets — the studio, the icon sheet (`planTileBase`) and the MCP server all read the
+same `monoTraceScale`, so `upscale: 'auto'` (the default) means the same thing everywhere:
+
+* **by SIZE** — the sheet's measured rule: toward ~512px, at most 3× (54 real 170px tiles:
+  ink-area drift 0.75pp → 0.13pp, 4× no better than 3×).
+* **by STROKE** — what the size rule misses: a 499px page of sheet music is not "small", but
+  its staff lines are 1px, and at 1× they melted into the note heads. `inkThickness`
+  (`src/lib/traceInput/strokeWidth.ts`) reads the thin ink's local thickness (min of the vertical and
+  horizontal run through each ink pixel, a low quantile by pixel) and enlarges it toward
+  3px, at most 4×. Measured on that page: 2× still broke the staff, 3× traced it clean.
+
+The larger wins, never past the flat cap, never for colour (palette segmentation follows
+every interpolated tone), plain bilinear (`upscaleImageData`). The census is
+`bench/strokeScaleDiag.ts` — gallery @256/@512 + `--sheets` + `--png` — and it renders
+BOTH traces back at native size before scoring (render an enlarged doc into a native buffer
+and it crops). 2026-09-21: 63 gallery marks enlarged, ΔE better 60 / worse 0, median ΔE
+1.89 → 0.98. `test/stroke-width.test.ts` is the gate; the Upscale control says what Auto did.
+
+The stroke probe found a second thing: the mono mask read the RGB luma of any pixel with
+alpha ≥ 16, so on art over TRANSPARENCY (anti-aliasing carried in alpha, black RGB
+everywhere) every stroke was a pixel fatter than drawn — the page's mask held 68% more ink
+than the picture, 1px lines read 2px, lyrics came out bold. `cutLuma` (`src/lib/traceInput/ink.ts`)
+composites the pixel over the paper the cut assumes (white, or black when inverted), so the
+mask's edge is the iso-0.5 coverage contour. Opaque art is byte-identical. `thresholdToMask`,
+the stroke probe and the three cut readouts (`snapCutToGap`, `cutFraction`, `inkLumaRange`)
+all go through it — a readout that disagrees with the mask by a pixel is worse than none.
+This moves the A/B **mono** lane (the fixtures trace on alpha); the pair
+`before-mono-upscale` ⇄ `after-mono-upscale` holds it.
+
+## There is ONE tracer, and mono goes through it
+
+Until 2026-09-22 there were three engines behind an "Engine" control — potrace (the 2003
+bilevel tracer, WASM, browser-only), "crisp" (a per-region marching-squares + `curveFit`
+tracer) and planar — and `mode: 'mono'` silently ran crisp whatever the control said. Two
+things followed from that and both are why the engines are gone: every corner, apex,
+junction, ring and sub-pixel rule since July lives in `planarFit`, and once the ink probe made
+Mono the default for one-ink art, most icons never reached it (a 61° peak traced as a 4px
+chamfer through crisp and to 0.5px through planar — §37); and the per-region tracers stacked
+overlapping shapes, so every boundary two colours share was drawn twice with a seam between
+the copies (bloom: ΔE 3.99 stacked against 0.04 planar). Measured on the eight fixtures, crisp
+was also twice as slow and not fewer nodes.
+
+So: `mono.ts` turns the cut into a two-label map (ink/paper, despeckled by component area at
+the old `turdsize` floor, and the source COMPOSITED over the paper so §15/§18 see a real ramp
+on transparent art) and hands it to `tracePlanar` like any segmentation. Mono's contract holds
+— one INK path, `#000000`, repainted by the caller — and it now carries the shared-edge
+`topology`.
+
+**An opaque ground comes back as the PAPER** (`src/lib/path/paper.ts`): one rectangle under
+the ink, id `paper`, in mono and line art alike (colour strokes too), dropped by Remove
+background — so a mark on a white page no longer traces onto transparency while the colour
+path keeps its background region. Three things that are easy to undo:
+
+* **Every repaint skips it** (`forceColorDoc`, the sheet/MCP `repaintDoc`): painted in the
+  ink it is a solid square. Anything that measures INK must skip it too — the centreline
+  scorer and `ink-mode.test.ts`'s coverage did not, and read the paper as ink.
+* **Its colour is the per-channel MEDIAN of the paper pixels, not the mean**: the edge
+  anti-aliasing is labelled paper and pulled a white page to `#fefefe`, which flipped 143
+  edge pixels across the centreline gate's 128 cut and failed `la-score @512`.
+* **"Opaque" is the border rule** (`hasOpaqueBorder`, ≥ half the ring visible), the same
+  test the colour path's background uses. Art on transparency gets no paper.
+
+`before-mono-paper` ⇄ `after-mono-paper`: 79 mono/line files gain the rectangle and nothing
+else (checked by stripping it); flat, grad and cline byte-identical. The icon sheet defaults
+to Remove background, so its tiles stay transparent. `test/mono-paper.test.ts` is the gate.
+
+**A bundled example can bring its own settings** (`Example.trace` → the store's
+`traceHints`): Sketch and Doodle load with Strokes on. The studio applies them over the
+probes on a FRESH image only and folds them into the Reset target, so Reset stays off after
+load. A fresh upload without hints clears them; they are session-only (a reload restores the
+options themselves). `VectorizeOptions.engine` is vestigial (`'planar'` only, kept so stored options
+parse); the stacked colour path, the V6 translucent decomposition that only ran on it, the
+`esm-potrace-wasm` dependency and the main-thread special case in `canTraceOffThread` went
+with the engines. `test/mono-labels.test.ts` and `test/harness.test.ts` are the gates.
+
+**A stacked output is a PAINT-ORDER post-pass, not a second tracer** (`layering: 'stacked'`,
+the **Layering** control under Color, MCP `layering`; `src/lib/trace/planarStack.ts`,
+benchmarks §41). The same graph, re-layered so a shape paints under the shapes in front of
+it; the rendered picture cannot change, only how it is built up. Two rules:
+
+* **Containment.** A hole whose interior is all opaque regions painted later is dropped, so
+  the container paints solid under them. No edge is refitted or copied — the lower region
+  just stops referencing the shared edge.
+* **Side by side: the T-junction.** Where one shape is in front, its outline runs THROUGH
+  the junction and the outline behind it STOPS and turns. The shape whose outline breaks
+  off is completed under its neighbours — along existing edges when its outline visibly
+  carries on (Mastercard: red's arc continues as the overlap's edge), else along a NEW
+  hidden edge between the two cut-off stems (a square behind a circle), accepted only if it
+  stays under the occluder. Contradictions resolve smallest hidden area first; paint order
+  is a DAG and an item is one (layer, label).
+
+Six things that are easy to undo:
+
+* **A label splits by LAYER.** The white page and the white counter of an O are one label,
+  and the counter must paint above the black ring (`trace-<l>`, then `trace-<l>-d<layer>`).
+* **A hole drops / a completion passes only under SOLID shapes** — nothing see-through
+  anywhere inside (EXT, a removed background, a translucent fill), or the region below
+  shows through.
+* **A completion along existing edges needs the FAR side of each followed edge painted
+  above it.** Otherwise both shapes anti-alias that edge over the page and the lower one's
+  colour fringes the other's rim (a disc split in two colours must stay tiled). This is
+  why only ONE of Mastercard's circles completes.
+* **Split crossings are part of their junction**: a crossing is often two vertices joined
+  by a micro-edge (≤ 1 px at 2048), so arms pair per cluster and chains carry the micro refs.
+* **A completion may only ADD to its shape.** Positive added area is not enough (a span
+  looping round the far side of a bridge dropped half of mercedes' star arm): every point
+  of the replaced span must lie inside the completed outline. The gate's
+  `keepsEveryRegion` renders each label both ways and fails on any pixel lost.
+* **Two halves completed along one line share ONE hidden edge** (aa-seam: both halves of a
+  seam a disc covers), so moving the junction moves both, like any planar boundary.
+
+**Users get STACKED; the tracer's default stays TILED.** `PRODUCT_VECTORIZE_OPTIONS`
+(`layering: 'stacked'`) is what the studio, the icon sheet (`DEFAULT_SHEET_TRACE`) and the MCP
+server start from; `DEFAULT_VECTORIZE_OPTIONS` has no `layering`, so the truth gate, the
+golden baseline, the labs and the A/B flat/grad lanes keep measuring the regions the tracer
+FOUND rather than the paint order laid over them. Don't merge the two: the gates score
+regions against the authored SVG, and a stacked region is bigger than what was drawn. A
+stored session without the key stays tiled until Reset or a new upload.
+
+**Mono ignores it.** Mono already lies the ink over ONE paper rectangle — the ring in Orbit is
+a ring, its hole shows the paper under it — so stacking there only added a paper-coloured
+disc on top of an ink one (tried and reverted 2026-10-06). The control shows when the trace
+RESOLVES to Colour and folds into "Looking for another option?" under Mono with that reason.
+
+**A shape the colour of what lies beneath it is the page showing through** — left out, and
+the shape around it keeps its hole. Without this, stacked colour filled every ring in and
+painted the counter back on top (Orbit: teal plate, white DISC, teal disc, white dot; an O:
+a black disc with a white one on it). With it, Orbit in colour is exactly the mono output —
+plate, then one white path. Two things that are easy to undo: it runs OUTSIDE IN, and a hole
+it re-opened no longer counts as "beneath" (Orbit's white dot read as "the white ring showing
+through" and vanished); and a shape any side-by-side completion involves is never left out.
+
+**There is no Auto button.** Mode is Color | Mono and shows what the trace IS; the ink probe
+picks it per image (the line under it says why), a click overrides it for THAT image, and a
+new image goes back to the probe (`onFreshImage` in `useContentProbe`; the icon sheet plans
+its own mode and keeps it). Internally `colorMode: 'auto'` still means "the probe decides" —
+it is just no longer a button, and "Use Mono/Color" under the control hands it back.
+
+Tiled is byte-identical to before the feature (`before-stacked` ⇄ `after-stacked`). The A/B
+lab has a sixth lane, **`stack`** (flat + stacked); `before-sidebyside` ⇄ `after-sidebyside`
+moves only that lane. `test/planar-stack.test.ts` is the gate; `bench/stackDiag.ts` the
+census; `bench/stackExplode.ts` paints every layer alone so a completion is visible.
+
+## A rounded polygon is read as lines and arcs BEFORE the general fit
+
+`src/lib/trace/planarFit/fillet.ts` (benchmarks §42). A closed loop that is nothing but
+straight runs joined by tangent arcs — a rounded rect, a stadium, a map pin — is emitted as
+exactly those lines and arcs, `smooth` tangent nodes carrying ONE handle. The general loop
+fit could not say that: its line candidates are C⁰ at both ends, so every side→corner join
+was a hard node with a 3–24° break, and under r ≈ 7px the corner detector made the arc one
+sharp node. `PlanarFitOptions.fillets` (on; off with Smoothing 0 or fidelity 0). A loop it
+cannot explain WHOLE returns null and takes the old path untouched, so a miss is the status
+quo and a false positive is a regression — every rule below was a measured false positive
+first, and each is easy to undo:
+
+* **It reads the estimator's points BEFORE the corner self-guard** (`RawSubpixelChain`).
+  That guard reverts any arc under r ≈ 9px to the lattice — the one stretch a radius is
+  read from. Points the estimator declined are strays: wider tolerance, a fifth of the
+  weight, never the end of a run, and run seeds are polygonalised from the measured points
+  ALONE (a 20° side has a stray every third step; with them in there is not one seed).
+* **A weak run is never kept.** A run that would not visibly leave the circle of the arc
+  beside it (sagitta L²/8r under 0.75px; 1.5 on a lattice chain) may be a chord of that arc
+  — the four flat extremes of a disc certify as runs. Weak runs go back to being gap, to a
+  fixpoint. Three rules for KEEPING one were built and each turned on hundredths of a pixel:
+  the same test kept a real 4px flat and three chords of a circle.
+* **Which way round is read off the chain, a point's place by its ORDER in it**, and the
+  turns must sum to 360°. A radial residual cannot tell the short arc between two runs from
+  the long way round the same circle.
+* **Two floors, then one answer per loop.** An arc needs r ≥ 3.5px AND a stand-off of 1px
+  from its corner (at a 45° turn r = 4 stands 0.33px off — what anti-aliasing does to a
+  sharp vertex); under them the node goes on the line intersection. A corner left sharp
+  that reads nearly the radius of one that was rounded makes both sharp, or a hexagon comes
+  back five sharp and one round.
+* **A sharp corner needs L·θ/8 of line each side** above that same sagitta — a 9° vertex
+  37px, a 90° one 4 — or a gentle curve is read as a polygon of its own chords.
+* **Emitted loops are exempt from beautify's circle / ellipse snap** (`PlanarTrace.rounded`).
+  A loop with no 60° corner no longer vetoes it, and "within 1.5px of an ellipse" turned a
+  correctly read SoundCloud bar into a spindle.
+* **Verdicts tolerate outliers, not a wrong model**: 5% of the points a test reads may be
+  over tolerance, none by more than 0.4px. On the single worst point, a triangle reading
+  48.01 / 48.03 / 48.04 for an authored 48 was thrown out for one point 0.01 over.
+
+Scope: CLOSED loops (a rounded rect cut by another shape is open edges and takes the general
+fit), and a SLANTED side needs measured points — on art over transparency the silhouette is
+an EXT-sided chain that stays on the lattice, so only upright shapes read there. Both are
+named in §42.5 with the next lever.
+
+The number is `tangentBreaks` (above): tier-0 flat @512 101 → 33, and exactly three cases
+move. `round-polys` is the fixture — the shapes and, in the same picture, the disc, sector,
+squircle and octagon that must NOT be read as them. `bench/filletDiag.ts` is the census
+(it checks every emitted arc against the AUTHORED art: one on a vertex the artist drew sharp
+is the false-positive count, and it is zero), `--list` the per-loop autopsy, `--breaks` the
+gate's table; `bench/nodeLook.ts` draws the nodes on a zoomed crop, which is how a 15° break
+is seen at all. `test/planar-fillet.test.ts` is the gate. With the fit off the tree is
+byte-identical to `before-fillets` (240 files); `before-fillets` ⇄ `after-fillets` is the pair.
+
+## An outline that runs THROUGH a junction leaves it on one tangent
+
+`throughPairs` (on; `planarThread.ts` + `fitOpenArc`'s `EndTangents`, benchmarks §42.7). A
+junction where one pair of arms continues straight through is placed on that pair's
+through fit, and both arms are fitted to leave it along the fit's tangent, so a mouth
+running past a cheek is G¹ there instead of dipping into a 60° cusp. The rules, each a
+measured false positive first and each easy to undo:
+
+* **One pair, read on the sub-pixel chains, both arms real edges** (ΔE ≥ 25: a seam lined
+  up with a wedge's side is not an outline).
+* **The shape in front is whole HERE** (`cutAt`, 24 px): the front of a crossing stays one
+  piece, the shape behind is cut. Local, or an interlaced ring fails everywhere.
+* **No other outline runs through**: a stem in line with one of the arms over TWICE the
+  window is the other shape's edge (`hairlines`: a red bar over the END of a black one —
+  over 12 px it scored exactly like `cl-ties`' string past a kite).
+* **Stem ≥ 25°** is only a floor; 45° (round one) refused real T's (`cl-ties` at 33°).
+* **The tangent is the two arms' own directions, averaged**, not the joined window's line:
+  an outline bordering two colours jogs by up to a pixel at the junction, and a line across
+  the jog tilts (5° on the Olympic rings, a ring's arc flattened).
+* **Never the ground's outline** (`groundLabel`): two arms sharing the background are two
+  shapes' silhouette meeting at a corner the artist drew.
+* **One arm follows the other** (`followThroughPairs`): the joined line tilts toward a
+  curving arm, the straight arm cannot follow within ε, so the arm that could is re-fitted
+  to the one its partner actually leaves on.
+* **The re-seat slides a geometric through junction ALONG its line only**
+  (`PlanarTrace.through`): across is the kink again, but skipping it outright left a thin
+  wedge's tip cut short on the lattice (`border-cross` hooked). Rank threads move freely.
+* **Beautify's line snap keeps the tangent** (`breaksThrough`): a chord within fidelity
+  can still be 6° off it, and the green ring's arc came back a line with a step.
+
+`before-junction-g1` ⇄ `after-junction-g1` is the pair; `filletDiag --breaks --toggle
+throughPairs --list` the census, `junctionDiag <case> --lane grad` the per-junction
+verdicts as a LANE traces them (`threadDiag --geometric` is the flat palette only).
+
+**A line hands its direction to the curve beside it** (`lineTangents`, `fitOpenArc`, §42.9):
+a line's ends offer its own direction as a tangent, so the cubic next to it can join G¹
+instead of at a 5–15° kink. Those tangents pair ONLY a line with its neighbouring cubic: a
+cubic bent onto a line direction and then met at a corner points nowhere (that cost a roof
+four kinks). `bench/compare/kinkJoins.ts` says what each counted kink joins; `run.ts --fit
+key=value` measures a fit option off and on through the real scorer.
+
+## Line art traces as STROKES — the centreline engine, and its own lane
+
+Mono has a second output. `centerline: true` (the **Strokes** toggle under Mono, MCP
+`strokes`) hands the ink cut to `src/lib/trace/centerline/` instead of `tracePlanar`: the
+middle of every line as an open or closed **stroked path with a measured width**, and the ink
+no stroke explains (a note head, a dot) as fills through the planar tracer. A Lucide icon comes
+back as the paths it was drawn as. `docs/vectorization-benchmarks.md` §39 is the method and
+the census; three things there were measured in and are easy to undo:
+
+* **The profile's reach is one half-width** (`profile.ts`). Widening it so a drifted skeleton
+  point could find its far edge made every case worse — at a concave corner the walk runs
+  along the other arm. A lopsided profile reads NO width, on purpose.
+* **A corner's apex is rebuilt from its arms, and the RASTER decides whether it is a corner**
+  (`fit.ts`): the distance transform at the apex must read a full half-width. That is what
+  keeps a tight smooth bend from being drawn as a spike, and it is also why an over-limit
+  miter (bevelled ink) stays rounded — §39.4.
+* **Don't smooth the pieces before the fit.** σ = 0.2 W shrinks every arc by σ²/2R and took
+  the corpus from 17 to 13 of 20; the staircase gets σ ≤ 2 px and nothing more.
+* **Where a stroke enters a fill, the fill's mask reaches its rim** (`blobs.ts`, the bridge
+  rule: a channel pixel whose ink ACROSS the stroke runs longer than the stroke is wide is
+  the fill's) — otherwise a bay the stem's channel cut stays in the mask and the fill is
+  traced around it, five nodes stacked at the join. Don't cap the flared width to get
+  there: that turned a uniform thick stroke's outer band into a fill. And two cut ends
+  collinear across one fill pair into one stroke (`assemble.ts`) — a staff line through a
+  note head. §39.6.
+
+**Strokes work in Colour too, and colour is NOT a second engine** (`centerline/colour.ts`).
+The flat palette finds the inks, the border rule finds the paper, and every ink is folded
+into ONE coverage raster (distance from the paper relative to that ink's, or the alpha on
+transparency) that `monoLabels` cuts at 128 — so the engine sees one line drawing and
+never learns there was colour. Two things there are easy to undo:
+
+* **Trace the UNION, not a mask per ink.** A red line over a blue one cuts the blue mask
+  in two; in the union it is one crossing the junction pairing threads, so both lines come
+  back whole. Per-ink masks are the obvious version and the wrong one.
+* **Colour is painted AFTER, and a stroke is cut where its ink changes** (`paintStrokes`).
+  The pairing is geometric, so a dark string tied to a pink kite's corner comes back as one
+  path round the kite and down the string. Each segment votes for the ink under it; runs
+  split at the node between them, runs shorter than the stroke width fold into a neighbour
+  (junction overlap). A change with no node at it stays one stroke in its majority ink.
+* **Strokes are STACKED as the source is** (`stackByInk`). The engine emits them in
+  assembly order, which painted a purple bar over the green stem that ends in it. Where two
+  inks' stroke discs overlap, the source pixel votes for the ink on top; the inks are
+  layered by those votes, per INK not per stroke. `before-colour-order` ⇄
+  `after-colour-order` moves the `cline` lane of five cases and nothing else.
+
+Dense overlapping LOOPS (five petal rings over a centre ring) trace badly in both modes —
+that is the engine's junction handling, not the paint; check mono before blaming colour.
+The mono path is untouched (`before-colour-strokes` ⇄ `after-colour-strokes`: every lane
+byte-identical). `test/colour-strokes.test.ts` is the gate.
+
+It has a **fifth A/B trace lane, `cline`** (colour + strokes, flat cap), and its own cases:
+`AB_COLOUR_LINE_CASES` — `bench/genLineArt.ts` writes them into
+`public/examples/colour-line-art/` (NOT `line-art/`: the mono gate and `lineArtGround` read
+every file there as one ink), plus the Doodle PNG. They run `flat` + `cline`, and the lab
+lists them under **Line art**. One is on transparency on purpose (`cl-transparent`: a white
+ink only alpha can find) — `colourLineArt(…, null)`, because an explicit `undefined` takes
+the `'white'` default and rasterizes the white line onto white.
+
+It has its own answer sheet because the outline lanes' cannot score it: `svgGround.ts`
+refuses strokes, and for the outline tracer that refusal is right. `bench/genLineArt.ts`
+writes `public/examples/line-art/` (thirteen synthetic ⌇ cases, twelve ◎ Lucide icons — ISC,
+already a dependency), authored WITH strokes because here the `d` IS the answer (an element
+marked `data-ground="none"` is drawn and never scored: texture a fixture puts in on purpose);
+`bench/lineArtGround.ts` reads them and `bench/centerlineScore.ts` scores centre / missed /
+width / topology / `turns` / fill IoU / rendered ΔE. `turns` counts traced paths that leave
+one authored stroke for another anywhere but an end-to-end join — an X traced as two Vs has
+an X's ends and paths and every point on SOME stroke, so nothing else sees it. `missed` is
+a mean over the MISSED samples: covering more ink can raise it (§39.8). `test/centerline-gate.test.ts` is the gate
+(KNOWN_DEFECTS, boolean, only shrinks); `bench/centerlineDiag.ts` is the table plus a contact
+strip per case with the score's losses drawn on it. `rasterizeDoc` paints strokes now
+(`test/raster-stroke.test.ts`), so the studio's ΔE and the Difference view work on a stroked
+trace — and a stroke-only path is `fill: 'none'`, which `parseHex` would have read as black.
+
+**The A/B lab has a fourth trace lane, `line`**, and a third case lane: the line-art cases run
+`mono` + `line` only (`AbCorpusCase.lanes`), both at the flat cap, and a stamp records per
+case which lanes it carries (`laneFiles` answers null for the rest). The line lane ran at 512
+for a day and a 512 trace stretched into a 2048 row read as a bad tracer — the lane shows
+what the app does, and the app never traces line art that small. The GATE still runs at 512
+as well as 2048 (small icons reach the 2–18 px stroke regime after the mono upscale), with
+its pixel limits scaled by the raster (`centerlineTol`, §39.7). A case that is in only ONE side of a
+comparison — a stamp older than the case, or older than its lane — shows as a one-sided row
+(`AbAnalysis.onlyIn`: that side's lanes alone, no verdict, kept under Changed only) rather
+than being hidden; the day the lane landed, hiding them made the pair view read as empty.
+Freeze a baseline before touching the engine like any tracer change — a fix that only
+moves the line lane still gets its own `before-` stamp, because the pair is the only place
+the change can be SEEN afterwards (a re-frozen `after-centerline` overwrote the reviewed
+traces once, and the baseline had to be rebuilt by reverting the fix). The pairs so far:
+`before-centerline` ⇄ `after-centerline` shows the outline lanes byte-identical across the
+engine's landing, with the twenty line-art cases one-sided on the after;
+`before-line-nodes` ⇄ `after-line-nodes` is the corner-index / stub-pairing / self-loop-weld
+fix (§39.3), which moves four line lanes (polylines, loops, score, and the star by 0.02 px)
+and nothing else; `before-fill-join` ⇄ `after-fill-join` is the fill-rim bridge and the
+pairing across a fill (§39.6); `before-line-2048` ⇄ `after-line-2048` is the first pair at
+the lane's real resolution — the flare cap and the surrounded-island rule that closed the
+holes 2048 exposed in a note head (§39.7). The icon-set field report (§39.8) is four pairs:
+`-line-junctions`, `-line-stubs`, `-line-arrows`, `-line-hybrid`, and its review two more:
+`-weld-chords`, `-end-hook`; `-junction-caps` is a Y junction nothing crosses (round ends). `-cup-weld` stops a split-crossing weld
+of nodes whose arms only POINT the same way (it ate la-cup's shaft); a KNOWN_DEFECTS entry may
+fail only the gates its prefix names.
+
+**What the icon-set field report taught the engine (§39.8)**, each easy to undo:
+
+* **A ring is read from its HOLE** (`holes.ts`, `ringPair`). Where strokes end on a small
+  ring the skeleton between them is a chord, and two chords at a junction are a corner to
+  the skeleton; no fit of the arms can say "ring". Don't replace it with a circle fit
+  through the arms — that was tried and the windmills read sagitta 0.
+* **A ring's arcs are never cluster links** (`onRing`). Straight sails ending on a small
+  ring pass within half a width of its quarter arcs; without the guard the cluster pass
+  took the ring for their crossing and deleted it.
+* **Cluster pairs rank by lying on ONE line**, not by straightness: two parallel strokes a
+  gap apart are equally straight with either continuation. The search is bounded.
+* **`thin.ts` is Lü–Wang (3 ≤ B ≤ 6), not Zhang–Suen's 2 ≤ B ≤ 6**: the original erases
+  2-pixel diagonal lines, and an arrowhead arm vanished with it. Going back moves the whole
+  line lane.
+* **Micro-stubs are relative AND measured**: ≤ 0.4 of the neighbours' width and ≤ 3 of it
+  long. "Shorter than the neighbour's width" catches none of them (they run 1.8–2.4).
+  The stub is not a stroke, but its INK is in the picture: it goes to the fills
+  (`stubInk.ts`). Dropping it silently was the first version; la-stubs now scores the
+  specks as fills, so it fails if they vanish.
+* **`strokesOnly` means no fills, not less ink** (`blobStrokes.ts`): every fill region is
+  drawn as round-capped strokes of its own skeleton, a dot as a point, and nothing is
+  routed to the fills. Don't implement it by dropping the fills.
+* **Hybrid routing needs a broken member for a caption** (`confidence.ts`). A row of like
+  marks is also a trash can's bars or a broadcast's arcs.
+* **A welded crossing's pairs are cut back past the OTHER stroke's ink** (`recutWelded`):
+  one width from its line, and bridged along their own lines. Cut back only to the node's
+  zone and chorded through the meet, a 33° X drew two bent arms.
+* **A free end's hook goes only where the end reads flat** (`dropEndHook`): thinning curls a
+  butt end into its cap's corner. A round cap has none, and on a curve the same test eats
+  the curvature.
+
+## The tracer ships TWICE, and only one of them is automatic
+
+A tracer change reaches the website by itself — Cloudflare Workers Builds is connected to this
+repo and deploys `main`. It does **not** reach anyone running `npx -y logolab`. That is the
+same tracer, published to npm as **`logolab`** from `packages/mcp`, and it only moves when
+someone cuts a release. **A tracer change is not shipped until you release one.**
+
+`packages/mcp` has no sources of its own: it points tsc at `src/mcp/server.ts` and compiles
+whatever that reaches (`src/mcp` plus `src/lib/{trace,path,sheet,png,traceInput}`,
+`src/lib/export/iconSpec.ts` and a couple of shared helpers — 55 files today; never `bench/`),
+so your change is already *in* the package the moment you edit the tracer. It is just unpublished.
+
+To release: bump the version in **`packages/mcp/package.json`** — the only place it lives; the
+server reads it (`packageVersion` in `src/mcp/runtime.ts`) rather than repeating it — then
+
+```
+pnpm test
+git tag v0.1.1 && git push origin v0.1.1     # tags are signed; make it LOCALLY
+```
+
+then Releases → Draft a new release → pick the existing tag → Publish. `release.yml` does the
+rest (trusted publishing over OIDC, no npm token, provenance attached) and refuses a tag whose
+version disagrees with the manifest. Do not let the GitHub UI create the tag for you: one made
+server-side is unsigned, and the workflow verifies the signature.
+
+### The package is also an Agent SKILL, and the skill is the CLI
+
+`npx -y logolab call <tool> key=value …` runs one MCP tool from a shell (`src/mcp/call.ts`
+connects a client to `createServer()` in-process — no second CLI surface), and
+`src/mcp/skill.ts` is a `SKILL.md` telling an agent when and how to use it.
+`logolab install --skill` writes it; `.claude-plugin/marketplace.json` →
+`plugins/logolab/` ships the same text as a Claude Code plugin. Two things that are easy
+to undo:
+
+* **The plugin's SKILL.md is a COPY** — edit `skill.ts`, then
+  `node src/mcp/server.ts skill > plugins/logolab/skills/logolab/SKILL.md`.
+  `test/mcp-skill.test.ts` fails on drift, and on any shown command naming an input the
+  tool does not have.
+* **The skill runs `logolab@latest`**, so a skill change that needs a new CLI feature is
+  broken for everyone until a release — the plugin goes live the moment it is on `main`.
+  `call` rejects unknown keys on purpose: zod strips them, and from a shell nobody sees it.
+
+### `test/mcp-package.test.ts` is what stops you shipping a broken package
+
+The package's dependency list is decided by IMPORTS, in files nobody edits with npm in mind.
+Add `import { x } from 'some-package'` anywhere in the tracer's graph and the app still works,
+the checkout still works, the typecheck still passes — and `npx -y logolab` dies at runtime
+with `ERR_MODULE_NOT_FOUND`, because that package was a devDependency of the app and was never
+declared by the package that ships. The test walks the real graph (static, dynamic, and the
+lazy `createRequire` that loads the optional sharp decoder) and fails on anything undeclared,
+on a dependency version that drifts between the two manifests, and on the server's version
+being hard-coded again instead of read. **If it fails, fix the manifests — never the
+assertion.**
+
+### `split_icon_sheet` is an icon-SET tool, and the set's rules live in `src/mcp/sheet.ts`
+
+An agent that split ten generated sheets for an evening wrote down what it had to work around
+(2026-10-07); `docs/mcp.md` lists what came of it and `test/mcp-sheet.test.ts` is the gate.
+The rules that are easy to undo:
+
+* **A `grid: { rows, cols }` hint replaces the gap question, it does not tune it**
+  (`DetectOptions.grid`, `mergeByLattice` in `detect.ts`): blobs are grouped at gap 0 and every
+  blob joins the cell its CENTRE falls in, on a lattice spanning the artwork's extent. Four of
+  the ten sheets had an icon whose pieces were further apart (dashed curve, corner brackets
+  ~100px) than its neighbours (~60px) — no `gap` can join one without the other. The merge
+  runs BEFORE noise/label classification, or a dashboard's wide bottom bar is read as caption
+  text and left out of its icon.
+* **A rejected lattice reports `row`/`col` as -1.** `inferGrid` used to write the positions it
+  was about to reject; the free-layout report then carried a lattice that did not exist.
+  Reading order (row cluster, then column) is still used to sort — a raw y-sort puts an icon
+  drawn 18px lower after its whole row.
+* **One ink per sheet** (`unifyInk`): tiles are probed one by one and a JPEG reads `#010101`
+  on one and `#000000` on the next. A tile's ink within the probe's own `SAME_INK_DE` of the
+  sheet's dominant ink is written as the sheet's; an ink within 3/255 of pure black or white
+  snaps to it. `ink` (hex or `currentColor`) overrides both, on `trace_icon` too.
+* **`normalize` is a post-pass on the MODEL** (`src/lib/path/normalize.ts`, ships in the
+  package): art bounds (strokes count half their width), one uniform scale, centred; the paper
+  becomes the whole box; gradients and the planar topology are transformed too, so the doc stays
+  consistent. Serialized at TWO decimals (`NORMALIZED_PRECISION`), the crop-sized trace keeps three.
+* **The manifest only ever deletes its own files**: plain names, `.svg`/`.png`, listed by the
+  previous run with the same prefix; a `limit`ed run ADDS to the record instead of replacing it
+  (a preview between two full runs must not make the second forget the first).
+* **`removeBackground` defaults ON for sheets** — `DEFAULT_SHEET_TRACE` in the app does the
+  same — and off everywhere else. A caption's box is the padded text line, never squared
+  (`applyBoxes`): squaring a 20px line gave a 640px box above the top of the sheet.
+
+## "Find best settings" scores candidates; it does not decide on load
+
+The Vectorize rail's **Find best settings** (`studio/bestSettings.ts` pure, `useBestSettings.ts`
+plumbing, benchmarks §40, `bench/bestSettingsDiag.ts`) traces five candidates on a 352px copy,
+scores them with the shipped `deltaEField` via `scoreOffThread`, and applies the winner. It runs
+ONLY when pressed. Three things that are easy to undo:
+
+* **A candidate is a PATCH, not a full options object.** It names only the keys it decides
+  (`undefined` = remove), and `withCandidate` applies it to the CURRENT options, so a runner-up
+  clicked after a slider moved keeps the slider, and a winner equal to a fresh upload's settings
+  leaves Reset off (`centerline: false` instead of absent is enough to break that).
+* **Mono candidates are painted in the probed ink even when it is near-black.** `freshSettings`
+  leaves #14161c as #000; scored that way every dark-grey one-ink mark loses to Flat by ~1.5 ΔE.
+* **Applying pins gradients only while the probe has not decided this image** (`decidedForRef`).
+  Pin it unconditionally and `useContentProbe` skips the image on every reload: no "why" line
+  under Mode and no Reset target.
+
+## The session is persisted, so studio state has TWO homes now
+
+Every studio's state used to be session-only. It isn't: a reload restores the upload, the
+appearance, the trace options and markers, the traced document (hand edits included), an
+un-applied cleanup cutout, the whole icon sheet with its traces, and the editor's drawing.
+`src/lib/persist/` owns it, and the split is by WHEN a value is needed, not by size:
+
+* **localStorage** for anything that must be right in the FIRST painted frame — the stores and
+  the studios seed their initial state from it synchronously. Async would mean rendering the
+  defaults and then snapping to the user's settings.
+* **IndexedDB** for bytes and documents. Read ONCE in `main.tsx`, before the first render, into
+  a module-level payload that panels `claim()` on mount — so a lazily-mounted studio never
+  races an async read against its own auto-trace.
+
+The header's **Saved chip** (`src/components/shell/SavedChip.tsx`) is the standing indicator, over
+`src/lib/persist/status.ts`. It must be able to say **Not saved**: private mode, a blocked
+origin and a full quota all make persistence impossible, and a chip that keeps reading "Saved"
+through that is worse than no chip. `test/save-status.test.ts` is the gate — both of its
+failure modes (reporting saved while a newer value is still in memory, or sticking on
+"saving") look identical to the working version in a screenshot.
+
+Two things to keep in mind when touching a studio:
+
+* Anything derived from the working PIXELS is stored with `assetKey` (`src/state/store.ts`), which is
+  reissued whenever those pixels change. Check it before adopting a restored value, or a trace
+  ends up shown over a different image than it was cut from.
+* A restored studio must not re-run the probes that set its defaults. `VectorizeStudio` keeps
+  the ink probe (it feeds the “why” line) but runs it MEASURE-ONLY on a restore — otherwise
+  the rampiness probe and the ink offer overwrite the user's own settings, which reads as
+  “my options reset themselves”. “Restore” is keyed to the IMAGE (`probedAssetKey` in the
+  stored view, `src/components/vectorize/probeLedger.ts`), not to a flag armed at mount: a
+  stored view exists after the first ever visit, and a “Clean SVG” source never probes, so a
+  mount-time flag survived an upload and handed the next image the previous image's options
+  (one-ink sheet music traced colour + gradients at 1024 while the panel said “One ink →
+  Mono”). `test/probe-ledger.test.ts` is the gate.
+
+## Every tab writes the ONE working logo — there is no Apply
+
+Cleanup, Vectorize and the Editor all edit the same plate (`logo` in the store) and write it
+themselves, debounced; switching tabs carries whatever is on it. Three things that are easy to undo:
+
+* **Vectorize must not trace its own output.** Its writes go through `publishTrace`, which keeps
+  the image it replaced as `traceInput` (persisted with the logo); the studio traces
+  `traceInput ?? logo` under `traceInput.assetKey`. Every OTHER write drops it, so after a
+  cleanup or editor change Vectorize traces that. Route a trace through `setProcessedSvg`
+  and the next slider move re-traces the trace.
+* **A write is never a visit.** Cleanup writes only once its pixels differ from what it opened
+  on (undoing everything puts that source back, an SVG as an SVG); Vectorize skips an
+  unchanged Clean-SVG pass; the Editor keeps its `doc !== opened` guard (below).
+* **A tab that remounts must come back to its own state**, or the next write overwrites edits:
+  Vectorize keeps its doc in a module slot (`studioSession.ts` `live`), the Editor follows the
+  plate by `seenKey` (another tab moved `assetKey` → reopen from the logo), Cleanup's reload
+  guard (`appliedSrcRef`) and `loads` tell its own writes from a new source.
+
+The icon sheet's per-tile studio is the exception: it passes `onApply`, keeps its "Done"
+button, and never touches the logo.
+
+## The Editor tab IS the working logo — on CHANGE, never on open
+
+`EditorPanel` pushes its document into the app's logo by itself (debounced); there is no
+"Use as logo" button any more. The guard that matters is `doc !== opened`: the studio fires
+`onChange` once with the document it was seeded with, and treating that as an edit is
+destructive rather than merely redundant — round-tripping an SVG through `parseSvg` →
+`serializeDoc` yields different markup for the same drawing, so *visiting* the tab would
+reissue the working image, bump `assetKey`, and drop the trace and cleanup keyed to it.
+
+It is also what makes opening an example or a dropped SVG harmless: your logo is untouched
+until you actually change something. Don't replace that check with a text comparison against
+`logo.svgText` — that is the weaker guard already sitting underneath it, and it does not hold
+across a parse round-trip.
+
+The open drawing lives in a MODULE-level slot as well as React state. This panel is a lazy
+route, so every tab click unmounts it, and the stored session can't stand in: the boot payload
+is claim-once and the first mount already took it. Without the slot, clicking to Preview and
+back dropped the drawing and showed the intake screen.
+
+## Live text is a GROUP whose children are a cache; booleans and shaping load on demand
+
+A text object (`T` tool, `src/lib/text/`) is a `GroupItem` with a `text` field. Its children
+are the laid-out glyph outlines, one compound path per fill, rebuilt from `text` on every
+change (`layoutGroup`). That is the whole trick: rendering, hit-testing, bounds, transforms,
+booleans and outline export all read the children and know nothing about text, and dropping
+`text` IS "Convert to curves". Four things that are easy to undo:
+
+* **`TextData.matrix` is the one transform in the model.** Every other coordinate is
+  absolute, but a relayout from absolute glyphs can't keep a scale, so `transformItem` composes
+  onto the matrix as well as moving the cached outlines. Forget either half and the next
+  keystroke snaps the text back.
+* **Paint the text model doesn't own is carried, colour is written back.** A gradient, stroke
+  or fill opacity on a text's outlines survives a relayout (`layoutGroup` copies it from the
+  old first child); a plain recolour goes into the STYLE too (`setFill` → `syncTextFill`),
+  or the next keystroke repaints the old colour.
+* **The typing is a real hidden `<textarea>`** (`stage/TextEditLayer.tsx`), so IME, the
+  clipboard and word deletes work. It is focused a frame LATE on purpose: focused during the
+  pointerdown that opened the text, the browser's own mousedown handling took focus back and
+  every typed letter ran as a tool shortcut. The global shortcuts also ignore bare keys while
+  a text is open, for the same failure.
+* **Text survives a reload only through the editor's own slot.** The logo is written as
+  outlines, so a stale `seenKey` (the slot not re-saved after the editor's own logo write)
+  reopened the drawing from the SVG and silently converted every text to curves.
+  `EditorPanel.applyToLogo` re-saves the slot with the new key.
+
+Shaping is HarfBuzz (`harfbuzzjs`, ~430 KB WASM: GSUB/GPOS features, kerning, variable
+axes) behind `ShapingFace`, so `test/text-layout.test.ts` runs the real engine on the real
+bundled font. Fonts are OFL files in `public/fonts/`, kept OUT of the precache and fetched
+when picked; uploads go to IndexedDB. Booleans are paper.js (`src/lib/editor/boolean.ts`,
+`test/editor-boolean.test.ts`). Both are reached only through dynamic `import()`, so neither
+is in the editor's chunk, and `harfbuzzjs` is excluded from Vite's dep pre-bundling because
+it finds its WASM via `import.meta.url`. The SVG export can write text as live `<text>`
+(the toolbar's "SVG text" toggle) through `serializeDoc`'s `group` hook. `model.ts` ships in
+the npm package and must not import the text engine.
+
+## A crash costs you ONE panel, and the report is the point
+
+There is an `ErrorBoundary` per route (`src/components/report/ErrorBoundary.tsx`, wired in `App.tsx`,
+plus a last-resort one at the root in `main.tsx`). Three traps, all of which look like working
+code:
+
+* **`resetKey={pathname}` is load-bearing.** The router renders whichever route matched into
+  the SAME position, so React reuses one boundary instance across every tab and only updates
+  its props. Drop the key and a crash in Preview follows you to Cleanup — a working panel
+  hidden behind a stale apology.
+* **The boundary goes OUTSIDE the `<Suspense>`**, or a chunk that fails to load rejects past
+  it to the root. That failure is reported differently on purpose (`isChunkLoadError`):
+  `React.lazy` caches the rejection, so "Reset this panel" can never fix it and the screen
+  offers a reload instead.
+* **The context is collected in `getDerivedStateFromError`** — the render phase, while the
+  crashing subtree is still mounted. `src/lib/report/reportContext.ts` is a registry that studios
+  publish a snapshot function into (`VectorizeStudio` publishes its live options through the
+  refs); by the time the fallback is COMMITTED those children are unmounted and every provider
+  they registered has unregistered itself, so a later read is silently empty.
+
+## Filing an issue is a FEATURE, and the crash screen is its rarest entry point
+
+`src/lib/report/issueReport.ts` fills in a GitHub issue FORM — `.github/ISSUE_TEMPLATE/*.yml` — and
+`src/components/report/ReportIssue.tsx` hangs it off four kinds: a **crash** (the boundary), a
+**failure** (any catch that turns an error into a message for the user: the vectorize status
+bar, the uploader, the sheet's failed tiles), a **problem** ("it traced and the result is
+wrong" — the most valuable report this project gets, and it needs no failure at all) and an
+**idea**, which goes to the feature form instead.
+
+A FORM, not a `body`. GitHub prefills a form field from a query parameter keyed by that
+field's `id`, so the machine half lands in its own Diagnostics box — `render: text`, so the
+app sends PLAIN text, not markdown — and the human boxes stay empty with their own
+placeholders. `test/issue-template.test.ts` is the gate that keeps the ids in the YAML and the
+ids in `FIELDS` from drifting: GitHub ignores a parameter matching no field, so a rename
+silently delivers an empty Diagnostics box on every report from then on.
+
+Splitting one body into several fields made `title` and the summary a FIXED head the budget
+cannot trim, so both are capped — otherwise a kilobyte-long error message pushes the link past
+the 414 limit with nothing left to cut.
+
+The header's bug button opens `components/report/ReportDialog`, not GitHub: which kind of thing is
+this, what to write, and a disclosure showing exactly what gets attached. Jumping straight to
+a stranger's issue tracker filed every idea as a bug and lost the people who bounced off the
+form. A crash screen and a failed trace keep their DIRECT links — they already know they are
+bugs and already hold the error. The labs popover moved to a FLASK so the bug glyph could mean
+reporting; two bug icons in one header would have meant neither of them said anything.
+
+The failure lane matters more than the crash lane. The tracer runs in a WORKER that catches its
+own errors, so its normal bad day is a red line in a status bar, not a throw — for a long time
+that line was the end of the road for a bug report.
+
+A failure also ASKS, rather than leaving a link and hoping: `src/lib/report/failureNotice.ts` raises a
+question into the existing bottom toast stack ("Could not vectorize this image. Report it?").
+A toast and not a modal — the user is mid-task and the app still works, so a dialog they have
+to dismiss before trying another setting would punish them for a failure that was not theirs.
+Two rules keep it from becoming noise, and both are gated by `test/failure-notice.test.ts`:
+a newer failure REPLACES the current question instead of stacking, and a DISMISSED failure
+never asks again this session (the answer was no; re-asking after every retry is how people
+learn to click a prompt away without reading it). A superseded question — a new trace started —
+clears WITHOUT being remembered as a no, because nobody answered it. The inline Report link
+stays either way.
+
+Three traps here too:
+
+* **A link's href is built during RENDER, and some of these links never re-render.** The mobile
+  menu is a drawer that is translated off-screen rather than unmounted, so its href was built
+  on the app's first render — before any studio had published anything — and filed reports with
+  the settings missing. `freshHrefProps` rebuilds it on `pointerdown`/`focus`, both of which
+  beat navigation (and make "copy link address" correct too).
+* **`redact()` is not cosmetic.** An error message likes to quote the URL it failed on, and in
+  this app that URL is sometimes a `data:` URL holding the user's actual logo. Without it, a
+  decode failure would carry the user's art into a public issue tracker. A report carries the
+  SHAPE of the art and never the art.
+* **The log collapses repeats** (`src/lib/report/errorLog.ts`, in memory, never persisted). A retrying
+  worker can produce one error fifty times and push everything that matters out of a 25-entry
+  buffer.
+
+The report is pure and gated by `test/issue-report.test.ts` + `test/error-log.test.ts`. It has a
+URL budget — GitHub answers a request line past ~8 kB with a 414 — and it spends that budget
+from the END, so the sections are ordered most-useful-first and it is the STACK that gets cut,
+never the options. The options are the half nobody can reconstruct from prose.
+
+## Tooltips FLIP, and the header's go below
+
+`src/components/ui/Tooltip.tsx` is the app's replacement for the native `title` attribute —
+there are no `title` attributes left in the rendered DOM, and adding one back is a regression,
+not a shortcut. Two things about it are easy to get wrong:
+
+* **Placement flips, it does not clamp.** The maths is pure and lives in
+  `ui/tooltipPlace.ts` (its own `.ts`, because node strips types from `.ts` and NOT `.tsx`, so
+  anything a test must reach has to be out of the component). Clamping BOTH axes into the
+  viewport is what put a header tooltip on top of the icon it described: a control 12px from
+  the top has no room above, so the default `top` side computed a negative y and the clamp
+  pulled the bubble back down onto its own trigger. It flips along the main axis now and
+  clamps only across it. `test/tooltip-place.test.ts` is the gate.
+* **Every header tooltip passes `side="bottom"`** anyway, so the placement is the intent
+  rather than a fallback being relied on. The two popover triggers pass an EMPTY label while
+  open (Tooltip then renders its child alone), so a bubble can't hover over the card it just
+  opened.
+
+While you are in there: `cursor: pointer` is a base rule on every enabled `button` /
+`[role=button]`, not a per-component class. It used to live only in `.btn`, which the header's
+bespoke icon buttons don't use — so the anchors in that row got a pointer from the browser and
+the buttons beside them didn't.
+
+## Icons come from `ui/icons`, and the animated ones are PORTED, not hand-written
+
+Import every icon from `src/components/ui/icons`, never from `lucide-react` (that is
+`test/animated-icons.test.ts`'s first gate). That module is all of lucide-react with ~60
+icons shadowed by animated versions, ported from **@respeak/lucide-motion-vue** by
+`scripts/port-motion-icons.mjs`: its Vue SFCs carry Motion variants that `motion/react` reads
+unchanged, so the script lifts the variants + element tree into `motionData.ts` (generated —
+re-run, don't edit) and one wrapper (`AnimatedIcon.tsx`) renders them. To animate another
+icon, add it to the script's `ICONS` and re-run; an icon with no upstream animation stays
+static. Three things that are easy to undo:
+
+* **The trigger is the CONTROL, not the glyph** — the icon listens on its closest button /
+  link / tab (hover, keyboard focus), skips a disabled one, and an icon outside any control
+  never animates.
+* **Reduced motion renders the static lucide icon**, not a Motion tree told to stand still.
+* **Check a port's geometry against lucide before adding it**: animate-ui's `flask` is a
+  512-unit custom drawing, not lucide's flask, and would have shipped as a different icon.
+
+## Offline: the precache list is computed, not globbed
+
+The app is a PWA. The service worker is hand-written (`src/pwa/sw.js`) and its precache list is
+computed at build time from the chunk graph (`scripts/swPlugin.ts`): reachable from the entry,
+stopping at `src/components/labs/`, `bench/` and the three optional heavyweight packages.
+A glob would precache all 31 MB — 27 MB of which is the research harness and the AI runtime that
+a user cropping a logo never opens.
+
+The walk follows imports AND **bare URL references in chunk code**, because that is how Vite
+emits a Web Worker — and the tracer runs in one. Dropping it makes “works offline” silently mean
+“works offline until you try to trace something”. `test/offline-precache.test.ts` is the gate.
+
+### The shell must never be cached as a REDIRECTED response
+
+A navigation may only be answered with a response that was not redirected. Hand `respondWith`
+a redirected one and the browser does not fall back to the network — it fails the navigation,
+and every route on the origin becomes Chrome's **“This site can't be reached / ERR_FAILED”**
+for as long as the worker is installed.
+
+The shell walks straight into it. `SHELL` is `/index.html`, and **Cloudflare Workers Assets
+answers `/index.html` with a 307 to `/`** — it normalises the pretty URL. `cache.add` follows
+that redirect and stores a perfectly good 200 under the `/index.html` key with `redirected`
+set, so the navigate branch then serves an illegal response to every navigation. That shipped,
+and it took the whole site down while looking like a server problem: the origin answers 200 to
+curl on every URL, the build log is clean, and the bug is invisible to anything that is not a
+browser. So `install` fetches and `put`s a rebuilt copy (`unredirected()`), and the navigate
+branch ALSO refuses a redirected hit — that half is recovery, not prevention, for shells
+already on disk from an older worker. `test/pwa-shell-redirect.test.ts` is the gate; it drives
+the real `sw.js` against a fetch that redirects the way production does.
+
+Neither `vite dev` nor `vite preview` redirects `/index.html`, so this reproduces **only**
+against the deployed host — which is why a local check is not evidence here.
+
+### “A new version is ready” must end in a reload
+
+The update policy is PROMPT (`src/pwa/register.ts`), so the notice's button is the ONLY way a
+waiting build ever takes over. It cannot reload the page itself — that races the handover and
+lands back on the old build — so it asks the worker to skip waiting and reloads on
+`controllerchange`. Everything that can go wrong there looks the same from the outside: a
+button that does nothing. `src/pwa/handover.ts` owns the three rules, and
+`test/pwa-handover.test.ts` is the gate:
+
+* A first claim is **not** a reload — the first worker of all claims the page seconds after a
+  first visit, and bouncing every new visitor is not an update.
+* A handover **is** one, however long ago the page was claimed. The guard that shipped read a
+  flag captured at BOOT, when a first-time visitor has no controller yet — so for the rest of
+  that tab's life every handover was mistaken for a first install and the reload was skipped.
+* One the **user asked for** always is, even if the handover never lands: `take()` arms a
+  grace timer, because a dead button is worse than a reload onto the same build.
+
+## Node
+
+Node ≥ 22; TS is run directly via `node --experimental-strip-types`. `pnpm test` = full suite.

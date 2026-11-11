@@ -1,0 +1,109 @@
+// Ready-made drawings for the editor's empty state, using the same cards as the
+// other intakes.
+//
+// A pick opens in the editor only; it doesn't replace the working logo until
+// it is edited. Each example is chosen for something to edit (flat shapes,
+// translucency, strokes, a gradient).
+
+import { useCallback, useState } from 'react'
+import type { EditableDoc } from '../../lib/path/types'
+import { parseSvg } from '../../lib/path/model'
+import { ExampleCard } from '../intake/ExamplesDialog'
+import { adoptIds } from './editorDoc'
+
+interface EditorExample {
+  /** File under public/examples/. */
+  file: string
+  name: string
+  /** One-liner: what this one gives you to edit. */
+  blurb: string
+}
+
+export const EDITOR_EXAMPLES: EditorExample[] = [
+  {
+    file: 'summit.svg',
+    name: 'Summit',
+    blurb: 'Two flat shapes, the simplest place to start pulling nodes.',
+  },
+  {
+    file: 'bloom.svg',
+    name: 'Bloom',
+    blurb: 'Three see-through circles to restack, group and recolour.',
+  },
+  {
+    file: 'orbit.svg',
+    name: 'Orbit',
+    blurb: 'A ring and a backdrop, for trying strokes, widths and caps.',
+  },
+  {
+    file: 'outline.svg',
+    name: 'Outline',
+    blurb: 'Line art drawn only with strokes. Every corner is a node you can edit.',
+  },
+  {
+    file: 'aurora.svg',
+    name: 'Aurora',
+    blurb: 'A gradient app icon. Edit the stops and keep the rounded frame.',
+  },
+  {
+    file: 'nebula.svg',
+    name: 'Nebula',
+    blurb: 'Exported from a design tool, with its layer folder intact.',
+  },
+]
+
+const exampleUrl = (file: string) => `${import.meta.env.BASE_URL}examples/${file}`
+
+export interface EditorExampleGridProps {
+  onOpen: (doc: EditableDoc, name: string) => void
+  /** Grid column classes; defaults to two columns. */
+  className?: string
+}
+
+/** The example cards; clicking one opens it in the editor. */
+export function EditorExampleGrid({ onOpen, className }: EditorExampleGridProps) {
+  const [loadingFile, setLoadingFile] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  const pick = useCallback(
+    async (ex: EditorExample) => {
+      if (loadingFile) return
+      setError(null)
+      setLoadingFile(ex.file)
+      try {
+        const res = await fetch(exampleUrl(ex.file))
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        const doc = parseSvg(await res.text(), { preserveGroups: true })
+        if (!doc) throw new Error('unparseable')
+        adoptIds(doc)
+        // The intake unmounts on success (the studio takes over), so the busy
+        // state only needs clearing on failure.
+        onOpen(doc, ex.name.toLowerCase())
+      } catch {
+        setError('Could not open that example. Check your connection and try again.')
+        setLoadingFile(null)
+      }
+    },
+    [loadingFile, onOpen],
+  )
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div className={`grid gap-3 ${className ?? 'sm:grid-cols-2'}`}>
+        {EDITOR_EXAMPLES.map((ex) => (
+          <ExampleCard
+            key={ex.file}
+            url={exampleUrl(ex.file)}
+            file={ex.file}
+            name={ex.name}
+            blurb={ex.blurb}
+            busy={loadingFile === ex.file}
+            disabled={!!loadingFile}
+            onClick={() => void pick(ex)}
+          />
+        ))}
+      </div>
+      {error && <p className="text-xs text-bad">{error}</p>}
+    </div>
+  )
+}

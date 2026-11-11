@@ -1,0 +1,835 @@
+// results.json → summary.md.
+//
+// What the summary leads with, and why:
+//   • the LEADERBOARD: mean rank per held-out corpus (leaderboardMarkdown, below), the one
+//     number that combines metrics of different units without a threshold or a weight, with
+//     its CI, Friedman / Nemenyi CD and Pareto shares. Everything after it is the evidence.
+//   • the HEADLINE LogoLab row is logolab-auto — what `npx logolab` users get, no per-case
+//     knowledge. logolab-gate is printed as a labelled reference row (its gradient flag is an
+//     oracle read off the authored SVG). Every row says which inputs it was given.
+//   • raw distributions and PAIRED comparisons against that row (per-case win rates, a
+//     paired bootstrap CI of the mean difference, significance), not a pass count. The
+//     truth-gate pass count is printed LAST, against tool-neutral limits (TRUTH_TOL), with
+//     where the limits came from.
+//   • every median says the n behind it; a "common cases" line repeats the geometry medians
+//     over the cases every main tool could be scored on, so survivorship cannot flatter the
+//     weakest tool.
+//   • every pixel median and SVG-Bench mean includes the failures (no output, or one resvg
+//     cannot draw), scored as a blank white image (SVG-Bench's
+//     rasterize_svg does the same).
+//   • the paper's rows come with the caveat that they are a different protocol.
+//   • a row with n < 10 is marked not comparable.
+//   • corpora print HEADLINE first (logos-cc0: this is a logo tool), then the other held-out
+//     corpora, then the in-sample ones — whatever order the run listed them in. An in-sample
+//     corpus can explain a result; it is never the first table a reader meets.
+
+import { corpusKind, type ScoreRow } from './types.ts'
+import {
+  RANK_METRICS,
+  cdGroups,
+  headlineCorpora,
+  leaderboard,
+  type BenchRow,
+  type Leaderboard,
+} from '../../src/components/labs/bench/benchData.ts'
+
+/** Held-out corpora that lead the summary, in this order. */
+export const HEADLINE_CORPORA = ['logos-cc0', 'svgemoji-v0']
+
+/** Headline corpora first, then held out, then in-sample; ties keep the run's order. */
+export function corpusOrder(rows: Pick<ScoreRow, 'corpus' | 'heldOut'>[]): string[] {
+  const seen = [...new Set(rows.map((r) => r.corpus as string))]
+  const held = new Map(rows.map((r) => [r.corpus as string, r.heldOut]))
+  const rank = (c: string): number => {
+    const h = HEADLINE_CORPORA.indexOf(c)
+    return h >= 0 ? h : held.get(c) ? HEADLINE_CORPORA.length : HEADLINE_CORPORA.length + 1
+  }
+  return seen
+    .map((c, i) => ({ c, i }))
+    .sort((a, b) => rank(a.c) - rank(b.c) || a.i - b.i)
+    .map(({ c }) => c)
+}
+
+const HEADLINE = 'logolab-auto'
+const ABLATION = /^logolab-abl-/
+const MIN_N = 10
+
+const LABEL: Record<string, string> = {
+  'logolab-auto': 'logolab-auto ★',
+  'logolab-gate': 'logolab-gate (oracle)',
+}
+const INPUTS: [string, string][] = [
+  [
+    'logolab-auto',
+    'The headline row. `npx logolab` (MCP traceIcon) on the PNG: probes pick mono/colour and gradients, with no per-case knowledge.',
+  ],
+  [
+    'logolab-abl-stacked-grad',
+    "An ablation: the studio's starting settings (stacked, gradients on) with the probes skipped, PNG only. No shipped path runs this.",
+  ],
+  [
+    'logolab-gate',
+    "A reference row: the truth gate's dev config (tiled) with `gradients` read off the authored SVG, an oracle no other tool gets.",
+  ],
+  ['vtracer-default', 'VTracer 0.6.4, no flags, PNG only.'],
+  ['vtracer-poster', 'VTracer `--preset poster` (its flat-colour preset), PNG only.'],
+  ['vtracer-swept', 'VTracer, best of a frozen grid picked on the in-sample corpora only (sweepVtracer.ts), PNG only.'],
+  [
+    'starvector-1b',
+    'StarVector-1B im2svg, SVG-Bench HF generation config, seed 0; sees the 512px PNG (its processor resizes to 224).',
+  ],
+  [
+    'logolab-strokes',
+    'The line corpora’s headline row. `npx logolab` (MCP traceIcon) on the PNG with mode=mono and `strokes` (the Strokes toggle): centreline strokes with a measured width.',
+  ],
+  ['logolab-outline', 'the same call without `strokes`: the filled outlines LogoLab draws with Strokes off.'],
+  [
+    'autotrace-centerline',
+    'AutoTrace 0.40.0 `-centerline` on the luma<128 PBM (as Potrace gets it); writes 1-px strokes, no width.',
+  ],
+  [
+    'potrace',
+    'Potrace 1.16, mono lane only (one dark ink on white), luma<128 cut, output painted in the case ink (-C).',
+  ],
+  [
+    'potrace-bin',
+    "Potrace 1.16 on every case binarised at luma<128, output black as-is: SVG-Bench's protocol, a colour-blind baseline.",
+  ],
+]
+
+/** What a table prints for a value that is not there. */
+export const NO_VALUE = 'n/a'
+
+/**
+ * The published markdown's punctuation: straight quotes and no dashes. A reason recorded on a
+ * row (`gtRefusal`, `geomRefusal`, an error) keeps its " — " in results.json, so it is printed
+ * as ": " here. This covers the blurbs too, which the site shares and sets with curly quotes.
+ */
+export const plainMarkdown = (md: string): string =>
+  md
+    .replace(/[‘’]/g, "'")
+    .replace(/[“”]/g, '"')
+    .replace(/\s*—\s*/g, ': ')
+    .replace(/–/g, '-')
+
+const median = (xs: number[]): number | null => {
+  if (!xs.length) return null
+  const s = [...xs].sort((a, b) => a - b)
+  const m = s.length >> 1
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2
+}
+const mean = (xs: number[]): number | null => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null)
+const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v)
+const vals = (rows: ScoreRow[], k: keyof ScoreRow): number[] => rows.map((r) => r[k]).filter(isNum)
+const fmt = (v: number | null, d = 2): string => (v === null ? NO_VALUE : v.toFixed(d))
+const kfmt = (v: number | null): string =>
+  v === null ? NO_VALUE : v >= 10000 ? `${(v / 1000).toFixed(1)}k` : v.toFixed(0)
+const med = (rows: ScoreRow[], k: keyof ScoreRow, d = 2): string => {
+  const xs = vals(rows, k)
+  return xs.length ? `${fmt(median(xs), d)} (${xs.length})` : NO_VALUE
+}
+const name = (t: string, n: number): string => `${LABEL[t] ?? t}${n < MIN_N ? ` ⚠n=${n}` : ''}`
+
+/** Deterministic PRNG (mulberry32), so the CIs are reproducible run to run. */
+function rng(seed: number): () => number {
+  let a = seed >>> 0
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0
+    let t = a
+    t = Math.imul(t ^ (t >>> 15), t | 1)
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+}
+
+/** Paired bootstrap of mean(d) over cases, 95% percentile CI. */
+export function pairedBootstrap(d: number[], B = 4000, seed = 1): { mean: number; lo: number; hi: number } {
+  const n = d.length
+  const r = rng(seed)
+  const ms: number[] = []
+  for (let b = 0; b < B; b++) {
+    let s = 0
+    for (let i = 0; i < n; i++) s += d[Math.floor(r() * n)]
+    ms.push(s / n)
+  }
+  ms.sort((a, b) => a - b)
+  return { mean: d.reduce((a, b) => a + b, 0) / n, lo: ms[Math.floor(0.025 * B)], hi: ms[Math.ceil(0.975 * B) - 1] }
+}
+
+// metric, lower is better?, digits
+const PAIRED: [keyof ScoreRow, string, boolean, number][] = [
+  ['meanDeltaE', 'ΔE mean', true, 2],
+  ['chamfer', 'chamfer px', true, 2],
+  ['docNodes', 'nodes', true, 0],
+  ['tangentBreaks', 'tangent breaks', true, 1],
+  ['sbDino', 'DINO', false, 4],
+  ['sbLpips', 'LPIPS', true, 4],
+  ['sbSsim', 'SSIM', false, 4],
+  ['sbMse', 'MSE', true, 5],
+]
+
+const pfmt = (p: number): string => (p < 1e-300 ? '< 1e-300' : p < 0.001 ? p.toExponential(1) : p.toFixed(3))
+const pct = (v: number): string => `${Math.round(v * 100)}%`
+
+/**
+ * The headline: MEAN RANK per held-out corpus (benchData.ts leaderboard(), the same pure
+ * function the hosted page's leaderboard.generated.ts is written from). Per case and metric
+ * the tools are ranked, a failure tied last; no thresholds, no weights. One table per corpus,
+ * never averaged across corpora, and the ablation view (oracle, swept and ablation rows
+ * included) collapsed under it with its label, never in its place.
+ */
+export function leaderboardMarkdown(rows: ScoreRow[]): string[] {
+  const out: string[] = []
+  const br = rows as unknown as BenchRow[]
+  const corpora = headlineCorpora(br)
+  if (!corpora.length) return out
+  out.push('## Leaderboard: mean rank (held-out corpora only)')
+  out.push('')
+  out.push(
+    'Per case and per metric every tool is ranked (1 = best; ties share the average rank), and a tool’s mean rank is ' +
+      'the mean over all its (case, metric) cells. Ranks combine metrics with different units without a threshold or a ' +
+      'weight. A tool whose own output failed or was refused for a metric is tied last there; a metric the ground truth ' +
+      'refuses on a case is left out of that case for everyone.',
+  )
+  out.push('')
+  out.push(
+    `Fill corpora are ranked on ${RANK_METRICS.fill.map((m) => m.label).join(', ')}; line corpora on ` +
+      `${RANK_METRICS.line.map((m) => m.label).join(', ')}. The CI is a 95% bootstrap over cases (2000 resamples, seeded). ` +
+      'Friedman and Nemenyi use each tool’s rank averaged over a case’s metrics (`case rank`). Tools closer than the ' +
+      'critical difference CD are not significantly different (Demšar 2006), and the note under each table joins them ' +
+      'with `~`. On a case, A Pareto-beats B when it is at least as good on every metric and better on one; `inc` means ' +
+      'each is better somewhere.',
+  )
+  out.push('')
+  out.push(
+    'The headline shows each tool as its users get it (defaults and named presets), and ★ marks LogoLab’s row in it. ' +
+      'The ablation view, collapsed under each table, adds the oracle, ablation and swept rows, each marked ◇.',
+  )
+  out.push('')
+  for (const corpus of corpora) {
+    const head = leaderboard(br, { corpus, view: 'headline' })
+    out.push(...board(head))
+    const abl = leaderboard(br, { corpus, view: 'ablation' })
+    if (abl.k > head.k) {
+      out.push('<details>')
+      out.push(
+        `<summary>Ablation view (not the headline; ${abl.k} rows, CD ${abl.cd05?.toFixed(2) ?? NO_VALUE} at α .05)</summary>`,
+      )
+      // Without this blank line the Hub and GitHub leave the table inside as plain text.
+      out.push('')
+      out.push('| # | row | mean rank | 95% CI | case rank | Pareto win / loss / inc |')
+      out.push('|---|---|---|---|---|---|')
+      abl.tools.forEach((t, i) =>
+        out.push(
+          `| ${i + 1} | ${t.tool}${head.tools.some((h) => h.tool === t.tool) ? '' : ' ◇'} | ${t.mean.toFixed(2)} | ` +
+            `[${t.lo.toFixed(2)}, ${t.hi.toFixed(2)}] | ${t.caseMean.toFixed(2)} | ` +
+            `${pct(t.pareto.win)} / ${pct(t.pareto.loss)} / ${pct(t.pareto.incomparable)} |`,
+        ),
+      )
+      out.push('')
+      out.push('</details>')
+      out.push('')
+    }
+  }
+  return out
+}
+
+/** Text for a markdown table cell. A bare pipe ends the cell, and `|Paths Δ|` holds two. */
+export const tableCell = (s: string): string => s.replace(/\|/g, '\\|')
+
+function board(b: Leaderboard): string[] {
+  const out: string[] = []
+  out.push(`### ${b.corpus}: ${b.kind} art, ${b.n} cases, ${b.k} tools`)
+  out.push('')
+  out.push(
+    `| # | tool | mean rank | 95% CI | case rank | Pareto win / loss / inc | ${b.metrics.map((m) => `${tableCell(m.label)} ${m.better === 'lower' ? '↓' : '↑'}`).join(' | ')} |`,
+  )
+  out.push(`|---|---|---|---|---|---|${b.metrics.map(() => '---').join('|')}|`)
+  b.tools.forEach((t, i) =>
+    out.push(
+      `| ${i + 1} | ${b.kind === 'line' ? lineName(t.tool, MIN_N) : (LABEL[t.tool] ?? t.tool)} | **${t.mean.toFixed(2)}** | [${t.lo.toFixed(2)}, ${t.hi.toFixed(2)}] | ` +
+        `${t.caseMean.toFixed(2)} | ${pct(t.pareto.win)} / ${pct(t.pareto.loss)} / ${pct(t.pareto.incomparable)} | ` +
+        `${b.metrics.map((m) => t.perMetric[m.key]?.toFixed(2) ?? NO_VALUE).join(' | ')} |`,
+    ),
+  )
+  out.push('')
+  const f = b.friedman
+  const sorted = [...b.tools].sort((x, y) => x.caseMean - y.caseMean)
+  const groups =
+    b.cd05 === null
+      ? []
+      : cdGroups(
+          sorted.map((t) => t.caseMean),
+          b.cd05,
+        )
+  out.push(
+    (f
+      ? `Friedman χ²(${f.df}) = ${f.chi2.toFixed(1)}, p ${pfmt(f.p)}; Iman-Davenport F(${f.df1}, ${f.df2}) = ` +
+        `${f.ff.toFixed(2)}, p ${pfmt(f.pF)}. `
+      : 'Friedman: too few cases or tools. ') +
+      `Nemenyi CD = ${b.cd05?.toFixed(3) ?? NO_VALUE} (α .05), ${b.cd10?.toFixed(3) ?? NO_VALUE} (α .10). ` +
+      (groups.length
+        ? `Not significantly different at α .05 (case rank within CD): ${groups
+            .map(([i, j]) =>
+              sorted
+                .slice(i, j + 1)
+                .map((t) => t.tool)
+                .join(' ~ '),
+            )
+            .join('; ')}.`
+        : 'Every pair of tools differs by more than the CD.'),
+  )
+  if (b.excluded.length) out.push('', `Not ranked: ${b.excluded.map((e) => `${e.tool}, ${e.reason}`).join('; ')}.`)
+  if (b.dropped.ground || b.dropped.unmeasured)
+    out.push(
+      '',
+      `Cells left out for every tool: ${b.dropped.ground} where the ground truth is refused, ${b.dropped.unmeasured} that no tool was measured on.`,
+    )
+  out.push('')
+  return out
+}
+
+/** Rows that carry pixel metrics: every row, a failure scored as white (score.ts scorePixels). */
+const rendered = (rs: ScoreRow[]): ScoreRow[] => rs.filter((r) => r.meanDeltaE !== undefined)
+
+export function summaryMarkdown(rows: ScoreRow[], meta: Record<string, unknown>): string {
+  const out: string[] = []
+  const tools = [...new Set(rows.map((r) => r.tool))]
+  const main = tools.filter((t) => !ABLATION.test(t))
+  out.push(`# Vectorizer comparison: ${meta.run}`)
+  out.push('')
+  out.push(
+    `Scored at ${meta.res}px (resvg, white)` +
+      (Array.isArray(meta.lineRes)
+        ? `; line corpora at ${meta.lineRes.join(' / ')}px (the A/B line lane's flat cap)`
+        : '') +
+      `. LogoLab ${meta.logolab}. Tools: ${main.join(', ')}` +
+      (tools.length > main.length ? `; ablation: ${tools.filter((t) => ABLATION.test(t)).join(', ')}.` : '.'),
+  )
+  out.push('')
+  out.push(...leaderboardMarkdown(rows))
+  out.push('## What each row was given')
+  out.push('')
+  for (const [t, s] of INPUTS) if (tools.includes(t)) out.push(`- \`${t}\`: ${s}`)
+  out.push('')
+  out.push('## How to read it')
+  out.push('')
+  out.push(
+    "- Geometry columns are LogoLab's own truth-gate metrics against the authored SVG (chamfer, p95, parsimony, " +
+      'corners invented, tangent breaks, regions), designed by the authors of one of the tools under test. ' +
+      "SVG-Bench columns are StarVector's released metric code (MSE / SSIM / LPIPS-vgg / DINOv2, StarCoder2 tokens). " +
+      'ΔE is the shipped `deltaEField` (CIE76) mean.',
+  )
+  out.push(
+    "- Medians print the n behind them as `value (n)`. Geometry is only defined where the tool's output and the " +
+      'answer sheet are both readable (no clip / style / stroke); the "common cases" line repeats the medians over ' +
+      'the cases where every main tool with any geometry has it.',
+  )
+  out.push(
+    '- Only the visible boundary counts, for every tool: traced outline that is painted over (stacked output) is neither a ' +
+      'query nor a match target. Parsimony leaves canvas-edge boundary out on both sides (a full-canvas background ' +
+      'path is otherwise ~2k px of free length); `nodes ÷ GT` is the raw anchor ratio.',
+  )
+  out.push(
+    '- Failures (no output, or one resvg cannot draw) are scored as a blank white image (SVG-Bench does the same) and still counted in `fail`.',
+  )
+  out.push(
+    '- `ms` is wall time: in-process and warm for LogoLab; process spawn + PNG/SVG file I/O for VTracer / Potrace; ' +
+      'GPU generation only for StarVector. It is not comparable across those groups.',
+  )
+  const corpora = corpusOrder(rows)
+  if (corpora.includes('svgemoji-v0'))
+    out.push(
+      "- Scope: svgemoji-v0 is held out from LogoLab's development, but it is selected inside LogoLab's niche: Twemoji " +
+        'only, fill-only, no gradients / clips / strokes (fetch_svgbench.py). The full 668-row split is a separate run.',
+    )
+  if (corpora.includes('logos-cc0'))
+    out.push(
+      '- Scope: logos-cc0 is 300 brand marks from gilbarbara/logos (CC0 artwork; the marks stay their owners’ ' +
+        'trademarks), stratified by colour count × gradients × wordmark/symbol and not selected for LogoLab’s niche: ' +
+        'strokes, masks and filters are kept (pixel metrics only, the refusal is counted below). Excluded with a ' +
+        'reason in manifests/logos-cc0.json: embedded rasters, live text, external refs, blank-on-white, and brands ' +
+        'in the in-sample gallery corpus.',
+    )
+  out.push('')
+
+  for (const corpus of corpora) {
+    const cr = rows.filter((r) => r.corpus === corpus)
+    if (corpusKind(corpus as ScoreRow['corpus']) === 'line') {
+      out.push(
+        ...lineSection(
+          corpus,
+          cr,
+          tools.filter((t) => !ABLATION.test(t) && cr.some((r) => r.tool === t)),
+        ),
+      )
+      continue
+    }
+    const held = cr[0]?.heldOut
+      ? HEADLINE_CORPORA.includes(corpus)
+        ? 'held out, headline'
+        : 'held out'
+      : 'in-sample (development)'
+    const cases = [...new Set(cr.map((r) => r.caseId))]
+    out.push(`## ${corpus}: ${cases.length} cases, ${held}`)
+    out.push('')
+    const ct = main.filter((t) => cr.some((r) => r.tool === t))
+
+    // ── distributions
+    out.push(
+      '| tool | n | fail | geom scored | ΔE mean p50 | chamfer p50 | p95 p50 | parsimony p50 | nodes ÷ GT p50 | nodes p50 | invented p50 | breaks p50 | regions all | bytes p50 | ms p50 |',
+    )
+    out.push('|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|')
+    for (const t of ct) {
+      const tr = cr.filter((r) => r.tool === t)
+      const ok = tr.filter((r) => r.status === 'ok')
+      const scored = ok.filter((r) => r.samples !== undefined).length
+      const flat = rendered(tr).filter((r) => r.flat && (r.regionsTrue ?? 0) > 0)
+      const regionsAll = flat.filter((r) => r.regionsRecovered === r.regionsTrue).length
+      out.push(
+        `| ${name(t, tr.length)} | ${tr.length} | ${tr.length - ok.length} | ${scored}/${tr.length} | ` +
+          `${fmt(median(vals(rendered(tr), 'meanDeltaE')))} | ${med(ok, 'chamfer')} | ${med(ok, 'p95')} | ` +
+          `${med(ok, 'parsimony', 1)} | ${med(ok, 'nodeRatio', 1)} | ${kfmt(median(vals(ok, 'docNodes')))} | ` +
+          `${fmt(median(vals(ok, 'cornersInvented')), 0)} | ${fmt(median(vals(ok, 'tangentBreaks')), 0)} | ` +
+          `${regionsAll}/${flat.length} | ${kfmt(median(vals(ok, 'bytes')))} | ${kfmt(median(vals(ok, 'ms')))} |`,
+      )
+    }
+    // common cases: every main tool with ≥ MIN_N rows here has geometry on the case. A tool with
+    // no geometry on ANY case (imagetracer-default: its own strokes leave no outline to score) is
+    // named and left out, or no case would qualify and every median in the line would be empty.
+    const big = ct.filter((t) => cr.filter((r) => r.tool === t).length >= MIN_N)
+    const measured = big.filter((t) => cr.some((r) => r.tool === t && r.status === 'ok' && isNum(r.chamfer)))
+    const common = cases.filter((c) =>
+      measured.every((t) => cr.some((r) => r.tool === t && r.caseId === c && r.status === 'ok' && isNum(r.chamfer))),
+    )
+    if (measured.length > 1) {
+      const none = big.filter((t) => !measured.includes(t))
+      out.push('')
+      out.push(
+        `Common cases (${common.length}/${cases.length}, where every tool with n ≥ ${MIN_N} and any geometry has it` +
+          `${none.length ? `; no geometry at all: ${none.join(', ')}` : ''}). Chamfer / p95 / nodes ÷ GT / breaks p50: ` +
+          measured
+            .map((t) => {
+              const rs = cr.filter((r) => r.tool === t && common.includes(r.caseId))
+              return `${t} ${fmt(median(vals(rs, 'chamfer')))} / ${fmt(median(vals(rs, 'p95')))} / ${fmt(median(vals(rs, 'nodeRatio')), 1)} / ${fmt(median(vals(rs, 'tangentBreaks')), 0)}`
+            })
+            .join('; '),
+      )
+    }
+
+    // ── paired vs the headline
+    if (ct.includes(HEADLINE)) {
+      out.push('')
+      out.push(
+        `Paired against **${HEADLINE}** (same cases): mean difference tool − ${HEADLINE} with a 95% paired-bootstrap CI ` +
+          `(4000 resamples, seeded), and how often the tool is strictly better. ✔ = CI excludes 0. ` +
+          `Negative is better for ΔE / chamfer / nodes / breaks / LPIPS / MSE, positive for DINO / SSIM.`,
+      )
+      out.push('')
+      out.push(`| tool | ${PAIRED.map(([, l]) => l).join(' | ')} |`)
+      out.push(`|---|${PAIRED.map(() => '---').join('|')}|`)
+      const head = new Map(rendered(cr.filter((r) => r.tool === HEADLINE)).map((r) => [r.caseId, r]))
+      for (const t of ct) {
+        if (t === HEADLINE) continue
+        const tr = rendered(cr.filter((r) => r.tool === t))
+        const cells = PAIRED.map(([k, , lower, d]) => {
+          const ds: number[] = []
+          let wins = 0
+          for (const r of tr) {
+            const h = head.get(r.caseId)
+            const a = r[k]
+            const b = h?.[k]
+            // geometry only where both are ok (a white render has none anyway)
+            if (!isNum(a) || !isNum(b)) continue
+            ds.push(a - b)
+            if (lower ? a < b : a > b) wins++
+          }
+          if (ds.length < 3) return NO_VALUE
+          const ci = pairedBootstrap(ds)
+          const sig = ci.lo > 0 || ci.hi < 0 ? ' ✔' : ''
+          const f = (v: number) => (v >= 0 ? '+' : '') + v.toFixed(d)
+          return `${f(ci.mean)} [${f(ci.lo)}, ${f(ci.hi)}]${sig} · ${wins}/${ds.length}`
+        })
+        out.push(`| ${name(t, tr.length)} | ${cells.join(' | ')} |`)
+      }
+    }
+
+    // ── SVG-Bench
+    out.push('')
+    out.push(
+      'SVG-Bench metrics (means over every row, failures as a white render; ↑ better: DINO, SSIM; ↓ better: LPIPS, MSE). ' +
+        '`tokens` is StarCoder2 on the SVG file as scored; for StarVector that is the post-processed file (cairosvg-repaired ' +
+        "on `cleaned` rows), so `model tok` is the model's own generated-token count (its StarCoder tokenizer, raw text):",
+    )
+    out.push('')
+    out.push('| tool | n | DINO ↑ | LPIPS ↓ | SSIM ↑ | MSE ↓ | tokens (file) | model tok |')
+    out.push('|---|---|---|---|---|---|---|---|')
+    for (const t of ct) {
+      const rs = rendered(cr.filter((r) => r.tool === t))
+      out.push(
+        `| ${name(t, vals(rs, 'sbSsim').length)} | ${vals(rs, 'sbSsim').length} | ${fmt(mean(vals(rs, 'sbDino')), 3)} | ${fmt(mean(vals(rs, 'sbLpips')), 3)} | ` +
+          `${fmt(mean(vals(rs, 'sbSsim')), 3)} | ${fmt(mean(vals(rs, 'sbMse')), 4)} | ${kfmt(mean(vals(rs, 'sbTokens')))} | ` +
+          `${t.startsWith('starvector') ? kfmt(mean(vals(rs, 'genTokens'))) : NO_VALUE} |`,
+      )
+    }
+    for (const t of ct.filter((t) => t.startsWith('starvector'))) {
+      const rs = rendered(cr.filter((r) => r.tool === t))
+      const by = (s: string) => rs.filter((r) => (r.notes ?? '').split(' ')[0] === s)
+      const part = (s: string) => {
+        const g = by(s)
+        return g.length
+          ? `${s} n=${g.length}: DINO ${fmt(mean(vals(g, 'sbDino')), 3)}, SSIM ${fmt(mean(vals(g, 'sbSsim')), 3)}, file tok ${kfmt(mean(vals(g, 'sbTokens')))}, model tok ${kfmt(mean(vals(g, 'genTokens')))}`
+          : null
+      }
+      out.push('')
+      out.push(`- ${t} by output status: ${['valid', 'cleaned', 'placeholder'].map(part).filter(Boolean).join('; ')}`)
+    }
+    if (corpus.startsWith('svgemoji')) {
+      out.push('')
+      out.push(
+        '*Paper rows, for context only (a different protocol):* StarVector arXiv 2312.11556v4 Table 1, SVG-Emoji: a different ' +
+          'case mix (Twemoji + OpenMoji + Noto, all rows; ours is ' +
+          (corpus === 'svgemoji'
+            ? 'the same 668 rows but rendered with resvg, not cairosvg'
+            : 'Twemoji-only, fill-only') +
+          '), rendered with cairosvg, VTracer and Potrace fed 128px input (ours: 512px). Do not read a gap to these rows as a reproduction error or a win.',
+      )
+      out.push('')
+      out.push('| paper row | DINO ↑ | LPIPS ↓ | SSIM ↑ | MSE ↓ | tokens |')
+      out.push('|---|---|---|---|---|---|')
+      for (const [n, d, l, s, m, tk] of PAPER_SVG_EMOJI) out.push(`| *${n}* | ${d} | ${l} | ${s} | ${m} | ${tk} |`)
+    }
+
+    // ── gates, last, tool-neutral
+    out.push('')
+    out.push(
+      `Truth-gate all-pass against tool-neutral limits: TRUTH_TOL (chamfer ≤ 1.0, p95 ≤ 2.5 px, parsimony ≤ 3.0, tier 0's ` +
+        `hand-set absolute bars, not fitted to any tool's output) plus the zero-tolerance gates (regions, ink kept ≥ 50%, ` +
+        `corners invented, tangent breaks, corner / circle recovery), every per-case allowance off. TIER_TOL[2] is not used: it ` +
+        `was fitted just above the p90 of LogoLab's own traces. Only rows with geometry can all-pass: ` +
+        ct
+          .map((t) => {
+            const ok = cr.filter((r) => r.tool === t && r.status === 'ok')
+            const all = ok.filter(
+              (r) => r.samples !== undefined && (r.gatesApplicable ?? 0) > 0 && r.gatesPassed === r.gatesApplicable,
+            ).length
+            return `${t} ${all}/${cr.filter((r) => r.tool === t).length}`
+          })
+          .join(', ') +
+        '. Most-failed gates: ' +
+        ct
+          .map((t) => {
+            const h = new Map<string, number>()
+            for (const r of cr.filter((r) => r.tool === t))
+              for (const g of r.failedGates ?? []) h.set(g, (h.get(g) ?? 0) + 1)
+            const top = [...h].sort((a, b) => b[1] - a[1]).slice(0, 3)
+            return `${t} ${top.map(([g, n]) => `${g}×${n}`).join(' ') || 'none'}`
+          })
+          .join('; ') +
+        '.',
+    )
+
+    // ── LogoLab auto's mono decisions
+    const monos = cr.filter((r) => r.tool === HEADLINE && /^mono\b/.test(r.notes ?? ''))
+    if (monos.length) {
+      const gate = new Map(cr.filter((r) => r.tool === 'logolab-gate').map((r) => [r.caseId, r]))
+      out.push('')
+      out.push(
+        `- ${HEADLINE} chose mono on ${monos.length}/${cr.filter((r) => r.tool === HEADLINE).length} cases (ΔE auto vs gate): ` +
+          monos
+            .map(
+              (r) =>
+                `${r.caseId.split('/')[1]} ${fmt(r.meanDeltaE ?? null)} vs ${fmt(gate.get(r.caseId)?.meanDeltaE ?? null)}`,
+            )
+            .join('; '),
+      )
+    }
+
+    // ── ablation
+    const abl = tools.filter((t) => ABLATION.test(t) && cr.some((r) => r.tool === t))
+    if (abl.length) {
+      out.push('')
+      out.push('LogoLab ablation, layering × gradients with no oracle (on svgemoji tiled + off = logolab-gate):')
+      out.push('')
+      out.push(
+        '| config | n | ΔE mean p50 | ΔE mean mean | regions all | gradient defs (rows with any) | chamfer p50 |',
+      )
+      out.push('|---|---|---|---|---|---|---|')
+      for (const t of [...abl, 'logolab-gate'].filter((t) => cr.some((r) => r.tool === t))) {
+        const rs = rendered(cr.filter((r) => r.tool === t))
+        const flat = rs.filter((r) => r.flat && (r.regionsTrue ?? 0) > 0)
+        out.push(
+          `| ${t} | ${rs.length} | ${fmt(median(vals(rs, 'meanDeltaE')))} | ${fmt(mean(vals(rs, 'meanDeltaE')))} | ` +
+            `${flat.filter((r) => r.regionsRecovered === r.regionsTrue).length}/${flat.length} | ` +
+            `${rs.filter((r) => (r.gradientDefs ?? 0) > 0).length} | ${med(
+              rs.filter((r) => r.status === 'ok'),
+              'chamfer',
+            )} |`,
+        )
+      }
+    }
+
+    // ── footnotes
+    const failed = cr.filter((r) => r.status !== 'ok')
+    const na = cr.filter((r) => r.status === 'ok' && r.geomRefusal)
+    const gtNa = cr.filter((r) => r.gtRefusal)
+    const degraded = cr.filter((r) => r.notes && /placeholder|truncated/.test(r.notes))
+    if (failed.length || na.length || gtNa.length || degraded.length) {
+      out.push('')
+      const reasons = (rs: ScoreRow[], f: (r: ScoreRow) => string): string => {
+        const h = new Map<string, number>()
+        for (const r of rs) h.set(f(r), (h.get(f(r)) ?? 0) + 1)
+        return [...h].map(([k, v]) => `${k} ×${v}`).join('; ')
+      }
+      if (failed.length)
+        out.push(
+          `- failures (pixel metrics from a white render, or the output's own where only the geometry scorer failed): ${reasons(failed, (r) => `${r.tool} ${r.status}: ${r.error ?? ''}`.slice(0, 120))}`,
+        )
+      if (na.length)
+        out.push(`- trace geometry n/a: ${reasons(na, (r) => `${r.tool} ${(r.geomRefusal ?? '').split(' — ')[0]}`)}`)
+      if (degraded.length)
+        out.push(`- placeholder / truncated outputs (scored as-is): ${reasons(degraded, (r) => r.tool)}`)
+      if (gtNa.length) {
+        // Per case, by the refusal's first clause ("masked geometry (mask)" — the reason, not the tags).
+        const perCase = new Map(gtNa.map((r) => [r.caseId, (r.gtRefusal ?? '').split(' (')[0].split(' — ')[0]]))
+        const h = new Map<string, number>()
+        for (const v of perCase.values()) h.set(v, (h.get(v) ?? 0) + 1)
+        out.push(
+          `- ground truth refused (pixel metrics only): ${perCase.size} case${perCase.size === 1 ? '' : 's'}: ${[...h]
+            .sort((a, b) => b[1] - a[1])
+            .map(([k, v]) => `${k} ×${v}`)
+            .join('; ')}`,
+        )
+      }
+    }
+    out.push('')
+  }
+  return plainMarkdown(out.join('\n'))
+}
+
+// ── LINE corpora (strokes-oss) ───────────────────────────────────────────────────────────
+//
+// Their own section, never a column of the fill table: the answer sheet is a set of
+// centrelines with widths, and a chamfer against an outline would be a different question.
+// The headline row is logolab-strokes (the Strokes toggle). Outline tracers get pixel
+// metrics only — their centreline cells read 'no strokes', and the n behind every median
+// says how many rows had strokes to score.
+
+const LINE_HEADLINE = 'logolab-strokes'
+/** The line table's own labels: its ★ is logolab-strokes, and logolab-auto (the fill
+ *  headline) is an ordinary row there — on stroke art it draws outlines like any other. */
+const lineName = (t: string, n: number): string => `${t === LINE_HEADLINE ? `${t} ★` : t}${n < MIN_N ? ` ⚠n=${n}` : ''}`
+
+/** One tool's line-corpus row: the medians the stroke table prints (exported for tests). */
+export interface LineStats {
+  tool: string
+  n: number
+  fail: number
+  /** Rows with a centreline score (the output had strokes). */
+  scored: number
+  deltaE: number | null
+  centre: number | null
+  centreP95: number | null
+  missed: number | null
+  widthErr: number | null
+  /** Median |ends Δ| and |paths Δ|: a stroke broken in two and two fused are both wrong. */
+  ends: number | null
+  paths: number | null
+  /** Rows with no turn / every centreline gate passed, over the scored rows. */
+  noTurns: number
+  allPass: number
+  nodes: number | null
+}
+
+export function lineStats(tool: string, rs: ScoreRow[]): LineStats {
+  const ok = rs.filter((r) => r.status === 'ok')
+  const sc = ok.filter((r) => isNum(r.clCentre))
+  const abs = (k: keyof ScoreRow) =>
+    sc
+      .map((r) => r[k])
+      .filter(isNum)
+      .map(Math.abs)
+  return {
+    tool,
+    n: rs.length,
+    fail: rs.length - ok.length,
+    scored: sc.length,
+    deltaE: median(vals(rendered(rs), 'meanDeltaE')),
+    centre: median(vals(sc, 'clCentre')),
+    centreP95: median(vals(sc, 'clCentreP95')),
+    missed: median(vals(sc, 'clMissed')),
+    widthErr: median(vals(sc, 'clWidthErr')),
+    ends: median(abs('clEndsDelta')),
+    paths: median(abs('clPathsDelta')),
+    noTurns: sc.filter((r) => r.clTurns === 0).length,
+    allPass: sc.filter((r) => (r.gatesApplicable ?? 0) > 0 && r.gatesPassed === r.gatesApplicable).length,
+    nodes: median(vals(ok, 'docNodes')),
+  }
+}
+
+const LINE_PAIRED: [keyof ScoreRow, string, number][] = [
+  ['meanDeltaE', 'ΔE mean', 2],
+  ['clCentre', 'centre px', 2],
+  ['clMissed', 'missed px', 2],
+  ['clWidthErr', 'width err', 3],
+  ['docNodes', 'nodes', 0],
+]
+
+function lineSection(corpus: string, cr: ScoreRow[], ct: string[]): string[] {
+  const out: string[] = []
+  const cases = [...new Set(cr.map((r) => r.caseId))]
+  const res = [...new Set(cr.map((r) => r.res))].join(' / ')
+  out.push(
+    `## ${corpus}: ${cases.length} cases, ${cr[0]?.heldOut ? 'held out' : 'in-sample (development)'}, line corpus (centrelines) at ${res}px`,
+  )
+  out.push('')
+  out.push(
+    '- The answer sheet is the authored strokes (bench/lineArtGround.ts): `centre` = distance from the traced centreline ' +
+      'to the nearest authored one (precision), `missed` = distance from authored centreline not under the traced ink ' +
+      'to the nearest traced one (recall; a mean over the missed samples only, so one absent stroke reads large), `width err` = relative ' +
+      'width error, `|ends Δ|` / `|paths Δ|` = topology against the authored strokes joined end to end, `no turns` = ' +
+      'rows where no traced path leaves one authored stroke for another (bench/centerlineScore.ts). Pixel values are ' +
+      `raw px at ${res}px; a 24-unit icon's 2-unit stroke is ${res === '2048' ? '~171' : 'w'} px wide here.`,
+  )
+  out.push(
+    '- A row with no stroked path (every outline tracer) has no centreline score and keeps its pixel metrics; ' +
+      '`cl scored` counts the rows that did. `gates` = every centreline gate of test/centerline-gate.test.ts with its ' +
+      'pixel limits scaled to the raster (centerlineTol), ΔE from the resvg render.',
+  )
+  out.push('')
+  out.push(
+    '| tool | n | fail | cl scored | ΔE mean p50 | centre p50 | centre p95 p50 | missed p50 | width err p50 | \\|ends Δ\\| p50 | \\|paths Δ\\| p50 | no turns | gates all-pass | nodes p50 |',
+  )
+  out.push('|---|---|---|---|---|---|---|---|---|---|---|---|---|---|')
+  const stats = ct.map((t) =>
+    lineStats(
+      t,
+      cr.filter((r) => r.tool === t),
+    ),
+  )
+  for (const s of stats) {
+    const sc = s.scored
+    const c = (v: number | null, d = 2) => (sc ? fmt(v, d) : 'no strokes')
+    out.push(
+      `| ${lineName(s.tool, s.n)} | ${s.n} | ${s.fail} | ${sc}/${s.n} | ${fmt(s.deltaE)} | ${c(s.centre)} | ${c(s.centreP95)} | ` +
+        `${c(s.missed)} | ${sc ? fmt(s.widthErr, 3) : NO_VALUE} | ${sc ? fmt(s.ends, 0) : NO_VALUE} | ${sc ? fmt(s.paths, 0) : NO_VALUE} | ` +
+        `${sc ? `${s.noTurns}/${sc}` : NO_VALUE} | ${sc ? `${s.allPass}/${sc}` : NO_VALUE} | ${kfmt(s.nodes)} |`,
+    )
+  }
+
+  // ── per icon set, for the stroke tools: the sets draw differently (Tabler closes circles
+  // as open arcs, Feather writes dots as zero-length lines) and a pooled median hides that.
+  const sets = [...new Set(cases.map((c) => c.split('/')[1]?.split('-')[0] ?? ''))]
+  const strokeTools = stats.filter((s) => s.scored > 0).map((s) => s.tool)
+  if (sets.length > 1 && strokeTools.length) {
+    out.push('')
+    out.push('By icon set (centre p50 / missed p50 / gates all-pass, over the scored rows):')
+    out.push('')
+    out.push(`| tool | ${sets.join(' | ')} |`)
+    out.push(`|---|${sets.map(() => '---').join('|')}|`)
+    for (const t of strokeTools) {
+      const cells = sets.map((set) => {
+        const s = lineStats(
+          t,
+          cr.filter((r) => r.tool === t && r.caseId.startsWith(`${corpus}/${set}-`)),
+        )
+        return s.scored ? `${fmt(s.centre)} / ${fmt(s.missed)} / ${s.allPass}/${s.scored}` : NO_VALUE
+      })
+      out.push(`| ${t} | ${cells.join(' | ')} |`)
+    }
+  }
+
+  // ── paired vs the line headline
+  if (ct.includes(LINE_HEADLINE) && ct.length > 1) {
+    const head = new Map(rendered(cr.filter((r) => r.tool === LINE_HEADLINE)).map((r) => [r.caseId, r]))
+    out.push('')
+    out.push(
+      `Paired against **${LINE_HEADLINE}** (same cases, both scored): mean difference tool − ${LINE_HEADLINE}, 95% ` +
+        'paired-bootstrap CI (4000 resamples, seeded), and how often the tool is strictly better (lower). ✔ = CI excludes 0.',
+    )
+    out.push('')
+    out.push(`| tool | ${LINE_PAIRED.map(([, l]) => l).join(' | ')} |`)
+    out.push(`|---|${LINE_PAIRED.map(() => '---').join('|')}|`)
+    for (const t of ct) {
+      if (t === LINE_HEADLINE) continue
+      const tr = rendered(cr.filter((r) => r.tool === t))
+      const cells = LINE_PAIRED.map(([k, , d]) => {
+        const ds: number[] = []
+        let wins = 0
+        for (const r of tr) {
+          const a = r[k]
+          const b = head.get(r.caseId)?.[k]
+          if (!isNum(a) || !isNum(b)) continue
+          ds.push(a - b)
+          if (a < b) wins++
+        }
+        if (ds.length < 3) return NO_VALUE
+        const ci = pairedBootstrap(ds)
+        const f = (v: number) => (v >= 0 ? '+' : '') + v.toFixed(d)
+        return `${f(ci.mean)} [${f(ci.lo)}, ${f(ci.hi)}]${ci.lo > 0 || ci.hi < 0 ? ' ✔' : ''} · ${wins}/${ds.length}`
+      })
+      out.push(`| ${lineName(t, tr.length)} | ${cells.join(' | ')} |`)
+    }
+  }
+
+  // ── SVG-Bench (pixel), every row
+  if (cr.some((r) => isNum(r.sbSsim))) {
+    out.push('')
+    out.push('SVG-Bench metrics (means over every row, failures as a white render):')
+    out.push('')
+    out.push('| tool | n | DINO ↑ | LPIPS ↓ | SSIM ↑ | MSE ↓ | tokens (file) |')
+    out.push('|---|---|---|---|---|---|---|')
+    for (const t of ct) {
+      const rs = rendered(cr.filter((r) => r.tool === t))
+      out.push(
+        `| ${lineName(t, vals(rs, 'sbSsim').length)} | ${vals(rs, 'sbSsim').length} | ${fmt(mean(vals(rs, 'sbDino')), 3)} | ` +
+          `${fmt(mean(vals(rs, 'sbLpips')), 3)} | ${fmt(mean(vals(rs, 'sbSsim')), 3)} | ${fmt(mean(vals(rs, 'sbMse')), 4)} | ` +
+          `${kfmt(mean(vals(rs, 'sbTokens')))} |`,
+      )
+    }
+  }
+
+  // ── most-failed centreline gates, and the footnotes
+  out.push('')
+  out.push(
+    'Most-failed centreline gates: ' +
+      strokeTools
+        .map((t) => {
+          const h = new Map<string, number>()
+          for (const r of cr.filter((r) => r.tool === t))
+            for (const g of r.failedGates ?? []) h.set(g, (h.get(g) ?? 0) + 1)
+          return `${t} ${
+            [...h]
+              .sort((a, b) => b[1] - a[1])
+              .slice(0, 4)
+              .map(([g, n]) => `${g}×${n}`)
+              .join(' ') || 'none'
+          }`
+        })
+        .join('; ') +
+      '.',
+  )
+  const failed = cr.filter((r) => r.status !== 'ok')
+  if (failed.length)
+    out.push(
+      `- failures (pixel metrics from a white render): ${failed.map((r) => `${r.tool} ${r.caseId.split('/')[1]}: ${(r.error ?? r.status).slice(0, 80)}`).join('; ')}`,
+    )
+  const na = cr.filter((r) => r.status === 'ok' && r.geomRefusal && r.geomRefusal !== 'no strokes')
+  if (na.length)
+    out.push(`- centreline n/a for another reason: ${na.map((r) => `${r.tool} ${r.geomRefusal}`).join('; ')}`)
+  // A case whose answer sheet the stroke reader refuses stays in the table (pixel metrics
+  // only, counted in n, never in `cl scored`) — said here, or it would read as a tool's miss.
+  const gtNa = [...new Set(cr.filter((r) => r.gtRefusal).map((r) => `${r.caseId.split('/')[1]} (${r.gtRefusal})`))]
+  if (gtNa.length) out.push(`- ground truth refused (pixel metrics only): ${gtNa.join('; ')}`)
+  out.push('')
+  return out
+}
+
+/** StarVector arXiv 2312.11556v4 Table 1, SVG-Emoji (mixed Twemoji/OpenMoji/Noto, cairosvg,
+ *  VTracer / Potrace fed 128px). Printed under its own caveat line, never in the tool table. */
+const PAPER_SVG_EMOJI: [string, number, number, number, number, string][] = [
+  ['VTracer (paper)', 0.981, 0.074, 0.894, 0.008, '15.7k'],
+  ['Potrace (paper)', 0.882, 0.267, 0.78, 0.067, '9.7k'],
+  ['StarVector-1B (paper)', 0.929, 0.217, 0.82, 0.063, '4.8k'],
+  ['StarVector-8B (paper)', 0.943, 0.193, 0.829, 0.052, '6.7k'],
+]

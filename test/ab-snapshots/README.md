@@ -1,0 +1,34 @@
+# A/B feature stamps — local only
+
+`pnpm gen:absnapshot [name] [--logos all|a,b|none]` freezes the tracer's current output
+here, one subdir per stamp, so the next change can be judged against it in **/labs/ab →
+Vs snapshot**. Each subdir holds, per case: the exact input pixels (`<id>.png`, plus
+`<id>.r<res>.png` for a lane that traces smaller), the serialized trace per lane the case
+runs (`<id>.flat.svg`, `<id>.grad.svg`, `<id>.mono.svg`; the ⌇/◎ line-art cases run
+`mono` and `line` only, so they carry `<id>.line.svg` and no colour lanes), and a
+`manifest.json` recording the git rev (`+dirty` when the tree had modifications), the date,
+and a full `createdAt` timestamp (the dropdown's sort key — stamps list newest first, and a
+same-day pair no longer sorts under an unrelated earlier stamp by name).
+
+**Nothing in here is committed** (`.gitignore`), for two reasons:
+
+- a stamp is a *working artifact*, not a source of truth — it is regenerable from any
+  revision (`git stash && pnpm gen:absnapshot && git stash pop` freezes the last committed
+  code), and what a change is judged against depends on what you are changing;
+- the ◆ gallery lane traces real brand marks from `examples/logos/`, which are themselves
+  gitignored trademarks (`npm run fetch:logos`). Their traces must not be redistributed
+  either.
+
+So a stamp lives exactly as long as you need it. Two consequences worth knowing:
+
+- switching branches will not delete these files (git does not touch ignored paths), but
+  they are yours alone — a stamp you want to keep should be copied somewhere outside the
+  repo, not pushed;
+- a few diagnostics read a specific stamp by name (`bench/rimCapDiag.ts` and
+  `rimCapRender.ts` want `before-lowres`). If it is not here, regenerate it from the
+  revision the diagnostic is about, or point the script at another stamp — both say so
+  when the file is missing.
+
+The workflow and the reasoning behind the input-pixel contract are in `docs/labs.md`
+("The A/B lab can compare against a frozen revision"); the case list — both lanes — is
+`bench/abCorpus.ts`.

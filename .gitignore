@@ -1,0 +1,62 @@
+# dependencies
+node_modules
+.pnpm-store
+
+# build output
+dist
+dist-ssr
+*.local
+
+# local env files — operator details (Impressum/Datenschutz) live here; never
+# commit real values. The committed template is .env.example (see below).
+.env
+.env.*
+!.env.example
+
+# editor / OS
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+
+# logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# test / automation artifacts (Playwright writes screenshots here)
+.playwright-mcp/
+
+# raw dropped-in source images (the deployed copies live in public/mockups/)
+/assets/
+
+# reference papers kept locally, not committed
+/examples/*.pdf
+
+# private ground-truth logo corpus — the brand-mark artwork itself is NOT
+# redistributed here (trademark/copyright). Only the manifest + fetcher are
+# tracked; run `npm run fetch:logos` to rehydrate the .svg files on demand.
+/examples/logos/*.svg
+
+# local real-world repro images (user-supplied, possibly trademarked artwork —
+# same policy as examples/logos: referenced from docs (§0 #13) but not redistributed)
+/examples/test-files/
+
+# generated dev-harness artifacts (crispnessStudy/facetSweep/paletteCompare output)
+/crispness-study/
+
+# vendored-corpus download cache (bench/vendorFluentEmoji.ts)
+/.cache/
+
+# A/B feature stamps (`pnpm gen:absnapshot`) — LOCAL working artifacts: a frozen copy
+# of the tracer's output used to judge the next change against, regenerable from any
+# revision, and (since the gallery lane) full of brand art that is not redistributed
+# here. The README explains the lifecycle; nothing else under it is committed.
+/test/ab-snapshots/*
+!/test/ab-snapshots/README.md
+
+# local benchmark tools (vtracer, potrace, models, venvs)
+.bench-tools/
+
+# howItWorks.ts staging folder (swapped into public/how-it-works when a run passes)
+public/how-it-works.next/

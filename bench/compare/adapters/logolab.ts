@@ -1,0 +1,137 @@
+// LogoLab's rows, each one serialised to a string and scored like any other tool.
+// VTracer gets three configurations too (adapters/external.ts).
+//
+//   logolab-auto     HEADLINE. src/mcp/trace.ts traceIcon on the PNG — what `npx logolab`
+//                    users get: the ink probe picks mono/colour, the gradient probe, the mono
+//                    upscale. No per-case knowledge.
+//   logolab-gate     traceImage + DEFAULT_VECTORIZE_OPTIONS (tiled) with `gradients` read off
+//                    the AUTHORED SVG — an ORACLE no other tool gets. It is the truth gate's
+//                    development configuration (test/truth-gate.test.ts), kept as a
+//                    reference row and labelled as such in summary.md, never the headline.
+//
+// Ablation lane (separate table, not the headline): the 2×2 of layering × gradients with no
+// oracle and no probes, so what each choice is worth is measured:
+//   logolab-abl-stacked-grad  PRODUCT_VECTORIZE_OPTIONS applied blind, which no shipped path
+//                             does. Called logolab-product up to run v8 (meta.renamed).
+//   logolab-abl-tiled-grad, logolab-abl-tiled-nograd, logolab-abl-stacked-nograd
+//
+// The truth gate scores the in-memory doc; here the doc goes through serializeDoc(doc, 2)
+// and back, the same string path every other tool's output takes. Timing is in-process and
+// warm (no process spawn, no file I/O) — see the ms note in summary.md.
+
+import { createHash } from 'node:crypto'
+import { execFileSync } from 'node:child_process'
+import { traceImage, DEFAULT_VECTORIZE_OPTIONS, PRODUCT_VECTORIZE_OPTIONS } from '../../../src/lib/trace/index.ts'
+import { serializeDoc } from '../../../src/lib/path/model.ts'
+import { traceIcon } from '../../../src/mcp/trace.ts'
+import { loadSource } from '../../../src/mcp/image.ts'
+import { REPO } from '../paths.ts'
+import type { TracerAdapter, TraceInput } from '../types.ts'
+
+export interface Provenance {
+  head: string
+  /** `git status --porcelain -- src bench` at start, verbatim. */
+  status: string[]
+  /** sha1 of `git diff HEAD -- src bench` plus every untracked file under them. */
+  diffSha1: string | null
+  dirty: boolean
+}
+
+let prov: Provenance | null = null
+/** Taken ONCE (the first call, at run start) and reused for every version string and meta. */
+export function provenance(): Provenance {
+  if (prov) return prov
+  const git = (...a: string[]): string => execFileSync('git', a, { cwd: REPO, encoding: 'utf8', maxBuffer: 1 << 28 })
+  try {
+    const head = git('rev-parse', '--short', 'HEAD').trim()
+    const status = git('status', '--porcelain', '--untracked-files=all', '--', 'src', 'bench')
+      .split('\n')
+      .filter(Boolean)
+    let diffSha1: string | null = null
+    if (status.length) {
+      const h = createHash('sha1').update(git('diff', 'HEAD', '--', 'src', 'bench'))
+      for (const line of status.filter((l) => l.startsWith('??')).sort()) {
+        const p = line.slice(3)
+        h.update(p).update(git('hash-object', p))
+      }
+      diffSha1 = h.digest('hex')
+    }
+    prov = { head, status, diffSha1, dirty: status.length > 0 }
+  } catch {
+    prov = { head: 'unknown', status: [], diffSha1: null, dirty: false }
+  }
+  return prov
+}
+const rev = (): string => {
+  const p = provenance()
+  return p.dirty ? `${p.head}+dirty.${p.diffSha1?.slice(0, 8)}` : p.head
+}
+
+const inProcess = (name: string, opts: (i: TraceInput) => Parameters<typeof traceImage>[1]): TracerAdapter => ({
+  name,
+  lanes: ['colour', 'mono'],
+  available: async () => null,
+  version: async () => `logolab@${rev()}`,
+  async trace(i) {
+    const t = performance.now()
+    const doc = await traceImage(i.image as unknown as ImageData, opts(i))
+    const ms = performance.now() - t
+    return { svg: serializeDoc(doc, 2), ms }
+  },
+})
+
+export const logolabGate = inProcess('logolab-gate', (i) => ({
+  ...DEFAULT_VECTORIZE_OPTIONS,
+  engine: 'planar',
+  gradients: i.case.gradients,
+}))
+
+export const logolabAuto: TracerAdapter = {
+  name: 'logolab-auto',
+  lanes: ['colour', 'mono'],
+  available: async () => null,
+  version: async () => `logolab@${rev()} traceIcon`,
+  async trace(i) {
+    const t = performance.now()
+    const out = await traceIcon(loadSource(i.pngPath), {})
+    return { svg: out.svg, ms: performance.now() - t, notes: out.plan.summary }
+  },
+}
+
+/**
+ * The LINE corpora's two LogoLab rows (strokes-oss), both through traceIcon on the PNG like
+ * logolab-auto, both with Mono asked for — every case there is one ink on white, and Mono
+ * is what the probe picks for it anyway; naming it keeps a probe change from moving the
+ * row into colour unnoticed:
+ *
+ *   logolab-strokes  HEADLINE of a line corpus. `strokes: true` — the MCP `strokes` option,
+ *                    the studio's Strokes toggle under Mono (centerline: true): centreline
+ *                    strokes with a measured width, dots and solid marks as fills.
+ *   logolab-outline  the same call without `strokes`: the filled outlines the app draws
+ *                    when Strokes is off. No centreline score (it has no strokes); here for
+ *                    the pixel metrics beside the outline tracers.
+ */
+const monoIcon = (name: string, strokes: boolean): TracerAdapter => ({
+  name,
+  lanes: ['colour', 'mono'],
+  kinds: ['line'],
+  available: async () => null,
+  version: async () => `logolab@${rev()} traceIcon mode=mono${strokes ? ' strokes' : ''}`,
+  async trace(i) {
+    const t = performance.now()
+    const out = await traceIcon(loadSource(i.pngPath), { mode: 'mono', ...(strokes ? { strokes: true } : {}) })
+    return { svg: out.svg, ms: performance.now() - t, notes: out.plan.summary }
+  },
+})
+export const logolabStrokes = monoIcon('logolab-strokes', true)
+export const logolabOutline = monoIcon('logolab-outline', false)
+
+const tiled = { ...DEFAULT_VECTORIZE_OPTIONS, engine: 'planar' as const }
+const stacked = { ...PRODUCT_VECTORIZE_OPTIONS }
+export const logolabAblation: TracerAdapter[] = [
+  inProcess('logolab-abl-stacked-grad', () => ({ ...stacked })),
+  inProcess('logolab-abl-tiled-grad', () => ({ ...tiled, gradients: true })),
+  inProcess('logolab-abl-tiled-nograd', () => ({ ...tiled, gradients: false })),
+  inProcess('logolab-abl-stacked-nograd', () => ({ ...stacked, gradients: false })),
+]
+export const ABLATION_TOOLS = new Set(logolabAblation.map((a) => a.name))

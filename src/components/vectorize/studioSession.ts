@@ -1,0 +1,107 @@
+// What the vectorize studio remembers across a reload.
+//
+// Settings go to localStorage because the studio reads them synchronously while
+// mounting; the document goes to IndexedDB (see lib/persist/session.ts).
+//
+// The document is stored with the `assetKey` of the image it was traced from, so
+// a restore can tell whether it still belongs to the picture on screen. Without
+// that check a new upload plus a reload would show the old trace over new art.
+
+import type { EditableDoc } from '../../lib/path/types'
+import type { VectorizeOptions } from '../../types'
+import type { InkColorMode } from '../../lib/traceInput/ink'
+import { debounce, readLocal, removeLocal, writeLocal } from '../../lib/persist/local'
+import { claim, saveSlot, SLOTS, type StoredVectorize } from '../../lib/persist/session'
+
+const LS_KEY = 'vectorize'
+
+/** Every studio control that isn't the document itself. */
+export interface StudioView {
+  opts: VectorizeOptions
+  colorMode: InkColorMode
+  forceColorOn: boolean
+  forceColor: string
+  /**
+   * Whether the user has set force-colour / gradients by hand. The auto-probes
+   * are suppressed by these flags, not by the values, so a deliberate choice
+   * survives a probe re-run.
+   */
+  forceColorTouched: boolean
+  gradientsTouched: boolean
+  /**
+   * The image (store `assetKey`) these options were decided for. A restore only
+   * suppresses the probes while this image is on screen (see probeLedger.ts).
+   * Absent on older stored views.
+   */
+  probedAssetKey?: string | null
+  retraceVector: 'clean' | 'retrace'
+  viewMode: 'split' | 'traced' | 'original' | 'overlay' | 'difference'
+  overlayOpacity: number
+  markMode: 'separate' | 'flat' | 'remove'
+}
+
+/** The document half, once it has been matched against the current image. */
+export interface StudioSeed {
+  view: StudioView | null
+  doc: EditableDoc | null
+  /** The restored doc carries hand edits — a settings change must warn, not re-trace. */
+  dirty: boolean
+}
+
+/**
+ * The studio's document, kept at module scope as well as in IndexedDB. The route
+ * is lazy, so every tab switch unmounts the studio, and the boot payload is
+ * claim-once: without this, coming back to the tab re-traced from scratch — and
+ * since the trace IS the working logo, that threw away node edits made here.
+ */
+let live: Pick<StoredVectorize, 'assetKey' | 'doc' | 'dirty'> | null = null
+
+/**
+ * Read the studio's stored state, once, for the image identified by `assetKey`.
+ *
+ * The document is *claimed*: taken out of the boot payload so that navigating
+ * away from /vectorize and back re-mounts the studio against live state instead
+ * of re-seeding the trace the user has since moved past.
+ */
+export function loadStudioSeed(assetKey: string): StudioSeed {
+  const claimed: StoredVectorize | null = claim('vectorize')
+  // The in-memory document wins: it holds the edits made since the boot payload.
+  const stored = live ?? claimed
+  const raw = readLocal<{ view: StudioView | null }>(LS_KEY, { view: null })
+  return {
+    view: raw.view ?? null,
+    doc: stored && stored.assetKey === assetKey ? stored.doc : null,
+    dirty: stored?.assetKey === assetKey ? stored.dirty : false,
+  }
+}
+
+/** Debounced: every slider in the left rail fires this once per pointer move. */
+export const saveStudioView = debounce((view: StudioView) => {
+  writeLocal(LS_KEY, { view })
+}, 300)
+
+/**
+ * Forget the stored settings, so the next image starts from the defaults and the
+ * probes rather than the last image's sliders. Called when the working logo is
+ * removed (which every upload and example load does first). The pending write is
+ * dropped too: flushed after this, it would restore exactly what was cleared.
+ */
+export function forgetStudioView(): void {
+  live = null
+  saveStudioView.cancel()
+  removeLocal(LS_KEY)
+}
+
+/**
+ * Store the document. The debounce is longer than the other slots' because this
+ * fires on every frame of a node drag and each write structured-clones the whole
+ * document; `pagehide` flushes any pending write.
+ */
+export function saveStudioDoc(assetKey: string, doc: EditableDoc | null, dirty: boolean): void {
+  live = doc ? { assetKey, doc, dirty } : null
+  if (!doc) {
+    saveSlot(SLOTS.vectorize, null)
+    return
+  }
+  saveSlot(SLOTS.vectorize, { assetKey, doc, dirty } satisfies Omit<StoredVectorize, 'v'>, 900)
+}

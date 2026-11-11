@@ -1,0 +1,801 @@
+// The properties rail: paint, geometry and alignment for the current selection.
+//
+// Numeric fields keep a local draft and commit on blur / Enter, so typing
+// doesn't push an undo step per digit or fight a cleared field.
+//
+// Colour wells and sliders have no commit moment, so they pass `live` with every
+// change and the studio merges the burst into one undo entry.
+
+import { memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  AlignCenterHorizontal,
+  AlignCenterVertical,
+  AlignEndHorizontal,
+  AlignEndVertical,
+  AlignHorizontalSpaceAround,
+  AlignStartHorizontal,
+  AlignStartVertical,
+  AlignVerticalSpaceAround,
+  FlipHorizontal,
+  FlipVertical,
+  Ban,
+  Expand,
+  Frame,
+  Pipette,
+  Shrink,
+  ToggleLeft,
+  ToggleRight,
+} from '../ui/icons'
+import type { EditableDoc, PathItem, Stroke } from '../../lib/path/types'
+import { leadPath } from '../../lib/editor/paintMatch'
+import { hasScreenEyeDropper, pickScreenColor } from './screenColor'
+import type { AlignEdge, DistributeAxis } from '../../lib/editor/align'
+import type { Box } from '../../lib/editor/transform'
+import { TipLabel, Tooltip } from '../ui/Tooltip'
+import { ActionButton, isOff } from '../ui/ActionButton'
+import { NumberField } from '../ui/NumberField'
+import { RangeInput } from '../ui/RangeInput'
+import { useFrameCoalesced } from '../ui/useFrameCoalesced'
+import { normalizeHex } from '../../lib/colorUtils'
+import { docPalette } from './editorDoc'
+import { drawingBounds, fitArtboardToDrawing, resizeArtboard, setArtboardMode } from '../../lib/editor/artboard'
+import { MAX_ARTBOARD, MIN_ARTBOARD } from './artboards'
+
+export interface InspectorProps {
+  doc: EditableDoc
+  selection: ReadonlySet<string>
+  box: Box | null
+  /** `live` marks one frame of a scrub, not a finished pick. */
+  onFill: (fill: string, live?: boolean) => void
+  onFillOpacity: (v: number, live?: boolean) => void
+  onFillRule: (rule: 'nonzero' | 'evenodd') => void
+  onStroke: (stroke: Stroke | null, live?: boolean) => void
+  onGeometry: (patch: { x?: number; y?: number; w?: number; h?: number }, live?: boolean) => void
+  onAlign: (edge: AlignEdge) => void
+  onDistribute: (axis: DistributeAxis) => void
+  onFlip: (axis: 'x' | 'y') => void
+  canDistribute: boolean
+  /** Artboard edits (mode, size, fit) — offered while nothing is selected. */
+  onArtboard: (next: EditableDoc, live?: boolean) => void
+}
+
+export function Inspector({
+  doc,
+  selection,
+  box,
+  onFill,
+  onFillOpacity,
+  onFillRule,
+  onStroke,
+  onGeometry,
+  onAlign,
+  onDistribute,
+  onFlip,
+  canDistribute,
+  onArtboard,
+}: InspectorProps) {
+  // Representative paint: the first selected path (walking into groups), which
+  // is what the swatches show and what editing them uses as the base. "Select
+  // same" matches this same path.
+  const lead: PathItem | null = leadPath(doc, selection)
+
+  // Deferred: every frame of a colour scrub changes the palette, and the strip
+  // can catch up once the drag settles instead of re-sorting mid-drag.
+  const paletteDoc = useDeferredValue(doc)
+  const palette = useMemo(() => docPalette(paletteDoc), [paletteDoc])
+  // Stable (unlike `onFill`), so the memoized <Palette> can skip re-renders.
+  const fillRef = useRef(onFill)
+  fillRef.current = onFill
+  const pickPaletteColor = useCallback((c: string) => fillRef.current(c), [])
+
+  if (selection.size === 0) {
+    return (
+      <div className="p-3">
+        <p className="text-xs text-faint">
+          Nothing selected. Click a shape, drag a marquee, or press{' '}
+          <kbd className="rounded border border-line px-1">Ctrl</kbd>+
+          <kbd className="rounded border border-line px-1">A</kbd>.
+        </p>
+        <div className="mt-4">
+          <ArtboardSection doc={doc} onChange={onArtboard} />
+        </div>
+        {palette.length > 0 && (
+          <div className="mt-4">
+            <h4 className="field-label mb-1.5">Document colours</h4>
+            <Palette palette={palette} />
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  // Why a paint control can't be used. `lead` is the first selected path, so
+  // without one the selection is only empty groups or raw markup.
+  const paintReason = lead
+    ? null
+    : 'Nothing paintable is selected. Imported markup keeps its own paint and can\u2019t be recoloured here.'
+  const spreadReason = canDistribute
+    ? null
+    : 'Select three or more items. Spacing two of them evenly is the same as aligning them.'
+
+  return (
+    <div className="flex flex-col gap-4 p-3">
+      <Section title="Arrange">
+        <div className="grid grid-cols-6 gap-1">
+          <AlignBtn label="Align left" note={ALIGN_REF} onClick={() => onAlign('left')}>
+            <AlignStartVertical size={14} />
+          </AlignBtn>
+          <AlignBtn label="Centre horizontally" note={ALIGN_REF} onClick={() => onAlign('hcenter')}>
+            <AlignCenterVertical size={14} />
+          </AlignBtn>
+          <AlignBtn label="Align right" note={ALIGN_REF} onClick={() => onAlign('right')}>
+            <AlignEndVertical size={14} />
+          </AlignBtn>
+          <AlignBtn label="Align top" note={ALIGN_REF} onClick={() => onAlign('top')}>
+            <AlignStartHorizontal size={14} />
+          </AlignBtn>
+          <AlignBtn label="Centre vertically" note={ALIGN_REF} onClick={() => onAlign('vcenter')}>
+            <AlignCenterHorizontal size={14} />
+          </AlignBtn>
+          <AlignBtn label="Align bottom" note={ALIGN_REF} onClick={() => onAlign('bottom')}>
+            <AlignEndHorizontal size={14} />
+          </AlignBtn>
+        </div>
+        <div className="mt-1 grid grid-cols-6 gap-1">
+          <AlignBtn
+            label="Distribute horizontally"
+            note="Spaces the selection evenly left to right; the outermost two stay put."
+            reason={spreadReason}
+            onClick={() => onDistribute('horizontal')}
+          >
+            <AlignHorizontalSpaceAround size={14} />
+          </AlignBtn>
+          <AlignBtn
+            label="Distribute vertically"
+            note="Spaces the selection evenly top to bottom; the outermost two stay put."
+            reason={spreadReason}
+            onClick={() => onDistribute('vertical')}
+          >
+            <AlignVerticalSpaceAround size={14} />
+          </AlignBtn>
+          <AlignBtn
+            label="Flip horizontally"
+            note="Mirrors the selection left-to-right inside its own bounding box, so it doesn't move."
+            onClick={() => onFlip('x')}
+          >
+            <FlipHorizontal size={14} />
+          </AlignBtn>
+          <AlignBtn
+            label="Flip vertically"
+            note="Mirrors the selection top-to-bottom inside its own bounding box, so it doesn't move."
+            onClick={() => onFlip('y')}
+          >
+            <FlipVertical size={14} />
+          </AlignBtn>
+        </div>
+      </Section>
+
+      {box && (
+        <Section title="Geometry">
+          <div className="grid grid-cols-2 gap-2">
+            <NumField
+              label="X"
+              tip="Left edge of the selection, in artboard units."
+              value={box.x}
+              onCommit={(v, live) => onGeometry({ x: v }, live)}
+            />
+            <NumField
+              label="Y"
+              tip="Top edge of the selection, in artboard units."
+              value={box.y}
+              onCommit={(v, live) => onGeometry({ y: v }, live)}
+            />
+            <NumField
+              label="W"
+              tip="Width. Resizes from the left edge, so X stays put."
+              value={box.w}
+              min={0.01}
+              onCommit={(v, live) => onGeometry({ w: v }, live)}
+            />
+            <NumField
+              label="H"
+              tip="Height. Resizes from the top edge, so Y stays put."
+              value={box.h}
+              min={0.01}
+              onCommit={(v, live) => onGeometry({ h: v }, live)}
+            />
+          </div>
+        </Section>
+      )}
+
+      <Section title="Fill">
+        <div className="flex items-center gap-2">
+          <ColorWell
+            label="Fill colour"
+            note="Drag in the picker to preview live. The whole drag is one undo step."
+            reason={paintReason}
+            value={lead?.fill ?? '#000000'}
+            onChange={(c) => onFill(c, true)}
+          />
+          <HexField
+            tip="Fill colour as a hex code. Applies on Enter or when you leave the field."
+            value={lead?.fill ?? '#000000'}
+            onCommit={(hex) => onFill(hex)}
+          />
+          <ScreenPickBtn label="Pick the fill from the screen" reason={paintReason} onPick={(hex) => onFill(hex)} />
+          <ActionButton
+            label="No fill"
+            note="Clears the fill so the shape paints only its stroke, if it has one."
+            reason={paintReason}
+            onClick={() => onFill('none')}
+            className={`btn btn-secondary h-8 gap-1 px-2 text-xs ${lead?.fill === 'none' ? 'is-active' : ''}`}
+          >
+            <Ban size={13} />
+            None
+          </ActionButton>
+        </div>
+
+        {palette.length > 0 && <Palette palette={palette} onPick={pickPaletteColor} />}
+
+        <div className="mt-2">
+          <SliderRow
+            label="Opacity"
+            tip="Fill opacity"
+            note="How see-through the fill is. The stroke has its own opacity setting below."
+            value={Math.round((lead?.fillOpacity ?? 1) * 100)}
+            onChange={(v) => onFillOpacity(v / 100, true)}
+          />
+        </div>
+
+        {/* Fill rule: which parts of a compound or self-crossing path count as inside. */}
+        <div className="mt-2 flex gap-1">
+          {FILL_RULES.map((r) => (
+            <ActionButton
+              key={r.id}
+              label={r.label}
+              note={r.note}
+              reason={paintReason}
+              onClick={() => onFillRule(r.id)}
+              className={`btn btn-secondary h-7 flex-1 px-2 text-[0.7rem] ${
+                lead?.fillRule === r.id ? 'is-active' : ''
+              }`}
+            >
+              {r.short}
+            </ActionButton>
+          ))}
+        </div>
+      </Section>
+
+      <StrokeSection stroke={lead?.stroke ?? null} onStroke={onStroke} />
+    </div>
+  )
+}
+
+function StrokeSection({
+  stroke,
+  onStroke,
+}: {
+  stroke: Stroke | null
+  onStroke: (s: Stroke | null, live?: boolean) => void
+}) {
+  const on = stroke !== null
+  const base: Stroke = stroke ?? { color: '#111827', width: 2, cap: 'butt', join: 'miter' }
+
+  return (
+    <Section title="Stroke">
+      <div className="flex items-center gap-2">
+        <ColorWell
+          label="Stroke colour"
+          note="Drag in the picker to preview live. The whole drag is one undo step."
+          value={base.color}
+          onChange={(c) => onStroke({ ...base, color: c }, true)}
+        />
+        <HexField
+          tip="Stroke colour as a hex code. Applies on Enter or when you leave the field."
+          value={base.color}
+          onCommit={(c) => onStroke({ ...base, color: c })}
+        />
+        <ScreenPickBtn label="Pick the stroke from the screen" onPick={(c) => onStroke({ ...base, color: c })} />
+        <ActionButton
+          label={on ? 'Stroke on' : 'Stroke off'}
+          note={on ? 'Click to remove the outline entirely.' : 'Click to give the selection an outline.'}
+          onClick={() => onStroke(on ? null : base)}
+          className={`btn btn-secondary h-8 gap-1 px-2 text-xs ${on ? 'is-active' : ''}`}
+        >
+          {on ? <ToggleRight size={14} /> : <ToggleLeft size={14} />}
+          {on ? 'On' : 'Off'}
+        </ActionButton>
+      </div>
+
+      {on && (
+        <>
+          <div className="mt-2">
+            <NumField
+              label="Width"
+              tip="Outline thickness in artboard units. It straddles the path: half inside, half outside."
+              value={base.width}
+              min={0}
+              step={0.5}
+              onCommit={(v, live) => onStroke({ ...base, width: v }, live)}
+            />
+          </div>
+          <div className="mt-2 grid grid-cols-2 gap-2">
+            <SegRow
+              label="Cap"
+              value={base.cap}
+              options={CAPS}
+              onChange={(v) => onStroke({ ...base, cap: v as Stroke['cap'] })}
+            />
+            <SegRow
+              label="Join"
+              value={base.join}
+              options={JOINS}
+              onChange={(v) => onStroke({ ...base, join: v as Stroke['join'] })}
+            />
+          </div>
+          <div className="mt-2">
+            <SliderRow
+              label="Opacity"
+              tip="Stroke opacity"
+              note="How see-through the outline is, separate from the fill."
+              value={Math.round((base.opacity ?? 1) * 100)}
+              onChange={(v) => onStroke({ ...base, opacity: v / 100 }, true)}
+            />
+          </div>
+          <div className="mt-2 flex gap-1">
+            {DASHES.map(({ dash, label, note }) => (
+              <ActionButton
+                key={label}
+                label={label}
+                note={note}
+                onClick={() => onStroke({ ...base, dash: dash.length ? dash : undefined })}
+                className={`btn btn-secondary h-7 flex-1 px-1 ${
+                  (base.dash?.join(',') ?? '') === dash.join(',') ? 'is-active' : ''
+                }`}
+              >
+                <svg width="34" height="8" aria-hidden>
+                  <line
+                    x1="1"
+                    y1="4"
+                    x2="33"
+                    y2="4"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeDasharray={dash.length ? dash.join(' ') : undefined}
+                    strokeLinecap="round"
+                  />
+                </svg>
+              </ActionButton>
+            ))}
+          </div>
+        </>
+      )}
+    </Section>
+  )
+}
+
+/**
+ * The document-colours strip. Memoized: traced art can have hundreds of
+ * distinct fills, and the strip only needs to re-render when its list changes.
+ */
+const Palette = memo(function Palette({
+  palette,
+  onPick,
+}: {
+  palette: { color: string; count: number }[]
+  onPick?: (color: string) => void
+}) {
+  // Native `title` rather than <Tooltip>: there can be hundreds of swatches,
+  // and each Tooltip carries its own state and portal.
+  return (
+    <div className={onPick ? 'mt-2 flex flex-wrap gap-1' : 'flex flex-wrap gap-1'}>
+      {palette.map((p) =>
+        onPick ? (
+          <button
+            key={p.color}
+            type="button"
+            title={`${p.color}: click to apply to the selection (${p.count} path${p.count === 1 ? '' : 's'} use it)`}
+            onClick={() => onPick(p.color)}
+            className="h-5 w-5 rounded ring-1 ring-line transition-transform hover:scale-110"
+            style={{ backgroundColor: p.color }}
+          />
+        ) : (
+          <span
+            key={p.color}
+            title={`${p.color} · ${p.count} path${p.count === 1 ? '' : 's'}`}
+            className="h-5 w-5 rounded ring-1 ring-line"
+            style={{ backgroundColor: p.color }}
+          />
+        ),
+      )}
+    </div>
+  )
+})
+
+/* ---------------------------------------------------------------- copy */
+
+/** Align aims at the artboard for one item and at the selection for several. */
+const ALIGN_REF =
+  'With one item selected this aligns to the artboard; with several, to the selection\u2019s own bounds.'
+
+const FILL_RULES = [
+  {
+    id: 'nonzero' as const,
+    short: 'Non-zero',
+    label: 'Non-zero fill rule',
+    note: 'Counts overlaps by direction: a hole appears only where a subpath winds the opposite way to the one around it. The SVG default.',
+  },
+  {
+    id: 'evenodd' as const,
+    short: 'Even-odd',
+    label: 'Even-odd fill rule',
+    note: 'Counts overlaps regardless of direction: every second layer of overlap becomes a hole. Try it when a hole fills in solid.',
+  },
+]
+
+/**
+ * A cap, drawn: a thick stroke ending on a dashed line where the PATH ends, so
+ * what a round or square cap adds past the end point is visible.
+ */
+function CapGlyph({ cap }: { cap: Stroke['cap'] }) {
+  return (
+    <svg viewBox="0 0 24 14" width={24} height={14} aria-hidden>
+      <line x1={2} y1={7} x2={14} y2={7} stroke="currentColor" strokeWidth={8} strokeLinecap={cap} opacity={0.85} />
+      <line x1={14} y1={1} x2={14} y2={13} stroke="var(--color-accent)" strokeWidth={1} strokeDasharray="2 1.5" />
+    </svg>
+  )
+}
+
+/** A join, drawn: one thick corner. */
+function JoinGlyph({ join }: { join: Stroke['join'] }) {
+  return (
+    <svg viewBox="0 0 24 14" width={24} height={14} aria-hidden>
+      <polyline
+        points="5,12.5 12,4 19,12.5"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth={4.5}
+        strokeLinejoin={join}
+        strokeMiterlimit={10}
+        opacity={0.85}
+      />
+    </svg>
+  )
+}
+
+const CAPS = [
+  { id: 'butt', label: 'Butt cap', note: 'The line stops dead at its end point.', glyph: <CapGlyph cap="butt" /> },
+  { id: 'round', label: 'Round cap', note: 'A half-circle carries past each end.', glyph: <CapGlyph cap="round" /> },
+  { id: 'square', label: 'Square cap', note: 'A half-square carries past each end.', glyph: <CapGlyph cap="square" /> },
+]
+
+const JOINS = [
+  { id: 'miter', label: 'Miter join', note: 'Corners run out to a sharp point.', glyph: <JoinGlyph join="miter" /> },
+  { id: 'round', label: 'Round join', note: 'Corners are rounded off.', glyph: <JoinGlyph join="round" /> },
+  { id: 'bevel', label: 'Bevel join', note: 'Corners are cut flat.', glyph: <JoinGlyph join="bevel" /> },
+]
+
+const DASHES = [
+  { dash: [] as number[], label: 'Solid line', note: 'An unbroken outline.' },
+  { dash: [6, 4], label: 'Dashed line', note: 'Six units on, four off.' },
+  { dash: [1, 4], label: 'Dotted line', note: 'Round dots, four units apart.' },
+]
+
+/* ------------------------------------------------------------- controls */
+
+/** The artboard: a fixed size you set, or one that follows the drawing. */
+function ArtboardSection({
+  doc,
+  onChange,
+}: {
+  doc: EditableDoc
+  onChange: (next: EditableDoc, live?: boolean) => void
+}) {
+  const grow = doc.artboard === 'grow'
+  const [, , w, h] = doc.viewBox
+  const empty = useMemo(() => drawingBounds(doc.items) === null, [doc.items])
+  return (
+    <Section title="Artboard">
+      <div className="mb-2 grid grid-cols-2 gap-0.5 rounded-lg bg-surface-3 p-0.5">
+        <ModeBtn
+          label="Fixed"
+          icon={<Frame size={12} />}
+          note="A set size. Anything drawn outside it is cropped from the export."
+          on={!grow}
+          onClick={() => onChange(setArtboardMode(doc, false))}
+        />
+        <ModeBtn
+          label="Grow"
+          icon={<Expand size={12} />}
+          note="No size limit: the artboard follows the drawing in every direction, and the export is cropped to the artwork."
+          on={grow}
+          onClick={() => onChange(setArtboardMode(doc, true))}
+        />
+      </div>
+      {grow ? (
+        <p className="text-[0.7rem] leading-relaxed text-faint">
+          {empty ? 'Draw anywhere. The artboard wraps whatever you draw.' : `${w} × ${h}, wrapped around the drawing.`}{' '}
+          Switch to Fixed to keep a size.
+        </p>
+      ) : (
+        <div className="flex flex-col gap-2">
+          <div className="grid grid-cols-2 gap-2">
+            <NumField
+              label="W"
+              tip="Artboard width. The top-left corner and the artwork stay where they are."
+              value={w}
+              min={MIN_ARTBOARD}
+              max={MAX_ARTBOARD}
+              onCommit={(v, live) => onChange(resizeArtboard(doc, v, h), live)}
+            />
+            <NumField
+              label="H"
+              tip="Artboard height. The top-left corner and the artwork stay where they are."
+              value={h}
+              min={MIN_ARTBOARD}
+              max={MAX_ARTBOARD}
+              onCommit={(v, live) => onChange(resizeArtboard(doc, w, v), live)}
+            />
+          </div>
+          <ActionButton
+            label="Fit to drawing"
+            note="Shrinks the artboard to fit the visible artwork, once. The size stays fixed afterwards."
+            reason={empty ? 'There is nothing drawn to fit around yet.' : null}
+            onClick={() => {
+              const next = fitArtboardToDrawing(doc)
+              if (next) onChange(next)
+            }}
+            className="btn btn-secondary h-7 gap-1 px-1.5 text-[0.68rem]"
+          >
+            <Shrink size={13} />
+            Fit to drawing
+          </ActionButton>
+        </div>
+      )}
+    </Section>
+  )
+}
+
+export function ModeBtn({
+  label,
+  icon,
+  note,
+  on,
+  onClick,
+}: {
+  label: string
+  icon: React.ReactNode
+  note: string
+  on: boolean
+  onClick: () => void
+}) {
+  return (
+    <ActionButton
+      label={label}
+      note={note}
+      pressed={on}
+      onClick={onClick}
+      className={`inline-flex h-7 items-center justify-center gap-1 rounded-md text-[0.7rem] font-medium transition-colors ${
+        on ? 'bg-surface text-accent shadow-xs' : 'text-ink-2 hover:text-ink'
+      }`}
+    >
+      {icon}
+      {label}
+    </ActionButton>
+  )
+}
+
+export function Section({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <section>
+      <h4 className="field-label mb-1.5">{title}</h4>
+      {children}
+    </section>
+  )
+}
+
+function AlignBtn({
+  label,
+  note,
+  onClick,
+  reason,
+  children,
+}: {
+  label: string
+  note?: string
+  onClick: () => void
+  reason?: string | null
+  children: React.ReactNode
+}) {
+  const off = isOff(reason)
+  return (
+    <ActionButton
+      label={label}
+      note={note}
+      reason={reason}
+      onClick={onClick}
+      className={`flex h-7 items-center justify-center rounded-md border border-line-strong bg-surface text-ink-2 transition-colors ${
+        off ? 'cursor-not-allowed opacity-40' : 'hover:bg-surface-3 hover:text-ink'
+      }`}
+    >
+      {children}
+    </ActionButton>
+  )
+}
+
+function ColorWell({
+  value,
+  onChange,
+  label,
+  note,
+  reason,
+}: {
+  value: string
+  onChange: (v: string) => void
+  label: string
+  note?: string
+  reason?: string | null
+}) {
+  // `none` is no paint; don't show the picker's black fallback as if it were.
+  const none = value.trim().toLowerCase() === 'none'
+  const off = isOff(reason)
+  // The picker fires on every pointer move; the drawing only needs a frame's worth.
+  const change = useFrameCoalesced(onChange)
+  // The tooltip goes on the well, not the input: a disabled input fires no
+  // pointer events (see ui/ActionButton.tsx), while the well still gets hover
+  // and the picker's bubbled focus.
+  return (
+    <Tooltip label={<TipLabel title={none ? `${label}: none` : label} detail={off ? reason : note} />}>
+      <span
+        className={`relative h-8 w-8 shrink-0 overflow-hidden rounded-md ring-1 ring-line-strong ${
+          none ? 'checkerboard' : ''
+        } ${off ? 'opacity-40' : ''}`}
+      >
+        {none ? (
+          <svg viewBox="0 0 32 32" className="absolute inset-0 h-full w-full" aria-hidden>
+            <line x1="4" y1="28" x2="28" y2="4" stroke="#d6453d" strokeWidth="3" />
+          </svg>
+        ) : (
+          <span className="absolute inset-0" style={{ backgroundColor: value }} />
+        )}
+        <input
+          type="color"
+          value={normalizeHex(value) ?? '#000000'}
+          aria-disabled={off || undefined}
+          onChange={off ? undefined : (e) => change(e.target.value)}
+          className={`absolute inset-0 opacity-0 ${off ? 'cursor-not-allowed' : 'cursor-pointer'}`}
+          aria-label={label}
+        />
+      </span>
+    </Tooltip>
+  )
+}
+
+/**
+ * The browser's eyedropper, for a colour from anywhere on screen (a reference
+ * image in another window included). Not rendered where the browser has none.
+ */
+function ScreenPickBtn({
+  label,
+  reason,
+  onPick,
+}: {
+  label: string
+  reason?: string | null
+  onPick: (hex: string) => void
+}) {
+  if (!hasScreenEyeDropper()) return null
+  return (
+    <ActionButton
+      label={label}
+      note="Click anywhere on the screen to take that colour; Esc cancels. To copy a whole shape's look, use the Eyedropper tool (I)."
+      reason={reason}
+      onClick={() => {
+        void pickScreenColor().then((hex) => {
+          if (hex) onPick(hex)
+        })
+      }}
+      className="btn btn-secondary h-8 w-8 shrink-0 px-0"
+    >
+      <Pipette size={13} />
+    </ActionButton>
+  )
+}
+
+function HexField({ value, onCommit, tip }: { value: string; onCommit: (v: string) => void; tip: string }) {
+  const [draft, setDraft] = useState(value)
+  useEffect(() => setDraft(value), [value])
+  const commit = () => {
+    const hex = normalizeHex(draft)
+    if (hex) onCommit(hex)
+    else setDraft(value)
+  }
+  return (
+    <Tooltip label={tip}>
+      <input
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') e.currentTarget.blur()
+          if (e.key === 'Escape') {
+            setDraft(value)
+            e.currentTarget.blur()
+          }
+          e.stopPropagation()
+        }}
+        spellCheck={false}
+        className="input h-8 min-w-0 flex-1 font-mono text-xs"
+      />
+    </Tooltip>
+  )
+}
+
+/** The editor's number input: the shared scrubbable field (drag the label, scroll, ↑/↓). */
+export const NumField = NumberField
+
+function SliderRow({
+  label,
+  tip,
+  note,
+  value,
+  onChange,
+}: {
+  label: string
+  tip: string
+  note: string
+  value: number
+  onChange: (v: number) => void
+}) {
+  return (
+    <label className="flex items-center gap-2">
+      <span className="w-14 shrink-0 text-[0.7rem] text-muted">{label}</span>
+      <Tooltip label={<TipLabel title={tip} detail={note} />}>
+        <RangeInput
+          min={0}
+          max={100}
+          wheelStep={5}
+          value={value}
+          aria-label={tip}
+          onValue={onChange}
+          className="min-w-0 flex-1 accent-[var(--color-accent)]"
+        />
+      </Tooltip>
+      <span className="w-9 shrink-0 text-right text-[0.7rem] tabular-nums text-muted">{value}%</span>
+    </label>
+  )
+}
+
+function SegRow({
+  label,
+  value,
+  options,
+  onChange,
+}: {
+  label: string
+  value: string
+  options: { id: string; label: string; note: string; glyph?: React.ReactNode }[]
+  onChange: (v: string) => void
+}) {
+  return (
+    <div>
+      <span className="mb-1 block text-[0.7rem] text-muted">{label}</span>
+      <div className="flex gap-0.5">
+        {options.map((o) => (
+          <ActionButton
+            key={o.id}
+            label={o.label}
+            note={o.note}
+            onClick={() => onChange(o.id)}
+            className={`btn btn-secondary min-w-0 flex-1 px-0.5 text-[0.6rem] capitalize ${
+              o.glyph ? 'h-auto flex-col gap-0.5 py-1' : 'h-7 text-[0.65rem]'
+            } ${value === o.id ? 'is-active' : ''}`}
+          >
+            {o.glyph}
+            <span className="truncate leading-none">{o.id}</span>
+          </ActionButton>
+        ))}
+      </div>
+    </div>
+  )
+}

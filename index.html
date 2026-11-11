@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- Don't leak a cross-site Referer: HuggingFace hotlink-protects model files
+         (returns 404 when a third-party Referer is present), which broke the
+         Cleanup view's in-browser AI background removal on the deployed origin. -->
+    <meta name="referrer" content="no-referrer" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+    <!-- Installable / offline (see src/pwa/). `theme_color` in the manifest is a
+         single value, but the app has two themes, so the live chrome colour is
+         set here per scheme — an installed window then matches the app instead of
+         framing a dark UI in a white title bar. -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#ffffff" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#15171d" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="LogoLab" />
+    <meta name="mobile-web-app-capable" content="yes" />
+
+    <!-- Anti-FOUC: apply the saved theme (or the OS preference for `system`)
+         synchronously, before the bundle paints, so there's no flash of the
+         wrong theme. Mirrors src/theme.ts; key must stay in sync with
+         THEME_STORAGE_KEY. -->
+    <script>
+      (function () {
+        try {
+          var mode = localStorage.getItem('logolab-theme');
+          var dark =
+            mode === 'dark' ||
+            ((mode === 'system' || !mode) &&
+              window.matchMedia('(prefers-color-scheme: dark)').matches);
+          var root = document.documentElement;
+          if (dark) root.classList.add('dark');
+          root.style.colorScheme = dark ? 'dark' : 'light';
+        } catch (e) {}
+      })();
+    </script>
+    <meta
+      name="description"
+      content="Free online vectorizer: turn a PNG or JPG logo into a clean SVG in your browser — no upload, no sign-up, no watermark. Preview it in real contexts, remove the background, and export favicons and PWA icons."
+    />
+    <title>LogoLab — free image to SVG vectorizer, logo preview & icon export</title>
+
+    <!-- Open Graph / Twitter Card — link-preview cards when shared on
+         HN, Reddit, X, Bluesky, Discord, Slack, LinkedIn, etc. -->
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://logolab.fabraham.dev/" />
+    <meta property="og:site_name" content="LogoLab" />
+    <meta
+      property="og:title"
+      content="LogoLab — preview, clean up & vectorize your logo"
+    />
+    <meta
+      property="og:description"
+      content="Preview a logo in real contexts, remove the background, vectorize to SVG, and export PWA icons. No uploads, no sign-up."
+    />
+    <meta property="og:image" content="https://logolab.fabraham.dev/og.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta
+      name="twitter:title"
+      content="LogoLab — preview, clean up & vectorize your logo"
+    />
+    <meta
+      name="twitter:description"
+      content="Preview a logo in real contexts, remove the background, vectorize to SVG, export favicons & PWA icons. Free, runs entirely in your browser."
+    />
+    <meta name="twitter:image" content="https://logolab.fabraham.dev/og.png" />
+    <link rel="canonical" href="https://logolab.fabraham.dev/" />
+
+    <!-- For search engines and AI assistants (ChatGPT, Claude, Perplexity…): most of
+         their crawlers do not run JavaScript, so this, the static copy in #root and
+         /llms.txt are all they ever learn about an SPA. Keep them in step with what
+         the app actually does. The title, description, og/twitter tags and canonical
+         below are rewritten per route at build time (scripts/routePages.ts). -->
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "WebApplication",
+        "name": "LogoLab",
+        "url": "https://logolab.fabraham.dev/",
+        "description": "Free in-browser vectorizer that converts PNG/JPG logos and icons into clean SVG (shared-edge tracing, curve fitting, line art as strokes), with background removal, an SVG editor, logo previews in real contexts and favicon/PWA icon export. Nothing is uploaded.",
+        "applicationCategory": "DesignApplication",
+        "operatingSystem": "Any (web browser)",
+        "browserRequirements": "Requires JavaScript",
+        "isAccessibleForFree": true,
+        "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+        "featureList": [
+          "Raster to SVG vectorization (PNG, JPG, WebP)",
+          "Colour, one-ink (mono) and gradient tracing",
+          "Line art traced as stroked centrelines",
+          "AI background removal in the browser",
+          "SVG editor with booleans and live text",
+          "Split an icon sheet into separate icons",
+          "Favicon, apple-touch, PWA and Android icon export",
+          "Works offline; no upload, no account, no watermark"
+        ],
+        "license": "https://opensource.org/licenses/MIT",
+        "codeRepository": "https://github.com/Blaxzter/LogoLab",
+        "sameAs": ["https://github.com/Blaxzter/LogoLab", "https://www.npmjs.com/package/logolab"]
+      }
+    </script>
+  </head>
+  <body>
+    <div id="root">
+      <!-- Replaced by the app on its first render; this is what a crawler that does
+           not run JavaScript reads. The build fills it in per route, with the
+           route's own head (scripts/routePages.ts holds the copy for every page). -->
+      <main></main>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

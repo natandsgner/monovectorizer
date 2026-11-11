@@ -1,0 +1,463 @@
+@import 'tailwindcss';
+
+/* Class-based dark mode: `.dark` on <html> flips the semantic tokens below.
+   `.dark *` so portaled overlays (Sheet, popovers rendered into <body>) inherit
+   it too. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ---------------------------------------------------------------------------
+   LogoLab design system — "Studio neutral light"
+   Calm, airy, neutral chrome with a refined indigo accent. The preview scenes
+   carry their own light/dark environments; the app chrome follows the app theme
+   (light by default; a calm neutral dark via the `.dark` overrides further down).
+--------------------------------------------------------------------------- */
+
+@theme {
+  /* Neutral surfaces */
+  --color-bg: #f4f5f7;
+  --color-bg-2: #eceef1;
+  --color-surface: #ffffff;
+  --color-surface-2: #fafbfc;
+  --color-surface-3: #f2f3f5;
+  --color-line: #e6e8ec;
+  --color-line-strong: #d6d9df;
+  /* Struck-out slider track: a range the control can reach but that cannot
+     produce a usable result (see ui/controls Slider `dead`). */
+  --slider-dead: #e9b9b9;
+
+  /* Ink */
+  --color-ink: #14161c;
+  --color-ink-2: #4b5462;
+  /* 4.5:1 on white AND on --color-bg: hints sit on both. */
+  --color-muted: #677080;
+  --color-faint: #aeb5c1;
+
+  /* Accent — refined indigo/iris */
+  --color-accent: #5b5bd6;
+  --color-accent-hover: #4f4fce;
+  --color-accent-soft: #ececfb;
+  --color-accent-fg: #ffffff;
+
+  /* BrandMark chip backplate — a near-black tile in light; relit in dark so the
+     mark doesn't vanish into a dark header (see the `.dark` override below). */
+  --color-brand-chip: #14161c;
+
+  /* Status */
+  --color-good: #21946b;
+  --color-warn: #c47d12;
+  --color-bad: #d6453d;
+
+  /* Radii */
+  --radius-xs: 6px;
+  --radius-sm: 8px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 20px;
+
+  /* Soft, layered shadows */
+  --shadow-xs: 0 1px 2px rgba(16, 18, 27, 0.04);
+  --shadow-sm: 0 1px 2px rgba(16, 18, 27, 0.06), 0 1px 1px rgba(16, 18, 27, 0.04);
+  --shadow-md: 0 4px 12px -2px rgba(16, 18, 27, 0.08), 0 2px 4px -2px rgba(16, 18, 27, 0.06);
+  --shadow-lg: 0 12px 32px -8px rgba(16, 18, 27, 0.14), 0 4px 8px -4px rgba(16, 18, 27, 0.08);
+  --shadow-xl: 0 24px 60px -12px rgba(16, 18, 27, 0.22), 0 8px 16px -8px rgba(16, 18, 27, 0.10);
+
+  /* Type */
+  --font-sans: 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto,
+    Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', 'JetBrains Mono', 'Cascadia Code', Menlo,
+    Consolas, monospace;
+}
+
+@layer base {
+  :root {
+    color-scheme: light;
+  }
+
+  /*
+   * A control that does something looks like one.
+   *
+   * `cursor: pointer` lived only inside `.btn`, and the header's icon controls
+   * do not use `.btn` — they carry their own `flex h-8 w-8 …`. So the two
+   * ANCHORS in that row (GitHub, Report a problem) got a pointer from the
+   * browser's own stylesheet while the five BUTTONS beside them (theme, labs,
+   * support, the Saved chip, Clear) kept the default arrow: one row of
+   * identical-looking icons, two different cursors, for a reason no user could
+   * possibly infer.
+   *
+   * Disabled is excluded on purpose — `.btn:disabled` says `not-allowed` and
+   * means it, and a control that cannot be pressed should not invite a press.
+   */
+  button:not(:disabled):not([aria-disabled='true']),
+  [role='button']:not([aria-disabled='true']) {
+    cursor: pointer;
+  }
+
+  /* ---------------------------------------------------------------------------
+     Dark theme — "Studio neutral dark"
+     Same neutral family as the light theme: cool near-black surfaces with a hair
+     of blue, soft off-white ink, the indigo accent preserved. Overriding the
+     semantic tokens here cascades to every `bg-surface` / `text-ink` / etc.
+     utility for free, so the whole shell flips without per-component `dark:`.
+     The preview scenes pin their own colors, so they are unaffected. The
+     transparency checkerboard is a separate, user-controlled system — untouched.
+  --------------------------------------------------------------------------- */
+  .dark {
+    color-scheme: dark;
+
+    /* Neutral surfaces — dark bg, progressively lighter elevations */
+    --color-bg: #0f1116;
+    --color-bg-2: #0b0d11;
+    --color-surface: #15171d;
+    --color-surface-2: #1a1d24;
+    --color-surface-3: #21242d;
+    --color-line: #262932;
+    --color-line-strong: #363b47;
+    --slider-dead: #5c3336;
+
+    /* Ink — soft off-white, not pure white */
+    --color-ink: #e8eaf0;
+    --color-ink-2: #b3bac7;
+    --color-muted: #828b9c;
+    --color-faint: #5c6473;
+
+    /* Accent — indigo preserved, nudged brighter so it carries on dark */
+    --color-accent: #6e6ef0;
+    --color-accent-hover: #8181f4;
+    --color-accent-soft: #292a4d;
+    --color-accent-fg: #ffffff;
+
+    /* Status — brightened so they read on dark surfaces */
+    --color-good: #34c98a;
+    --color-warn: #e0a13a;
+    --color-bad: #f06560;
+
+    /* BrandMark chip — relit so the tile separates from the dark header */
+    --color-brand-chip: #2a2e3a;
+
+    /* Shadows — deeper and near-black; soft light-theme shadows disappear here */
+    --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.5), 0 1px 1px rgba(0, 0, 0, 0.4);
+    --shadow-md: 0 4px 12px -2px rgba(0, 0, 0, 0.55), 0 2px 4px -2px rgba(0, 0, 0, 0.45);
+    --shadow-lg: 0 12px 32px -8px rgba(0, 0, 0, 0.62), 0 4px 8px -4px rgba(0, 0, 0, 0.5);
+    --shadow-xl: 0 24px 60px -12px rgba(0, 0, 0, 0.72), 0 8px 16px -8px rgba(0, 0, 0, 0.55);
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    /* The mobile appearance drawer parks off-canvas (translated past the right
+       edge); clip it here so it never adds a horizontal scrollbar. */
+    overflow-x: hidden;
+    background-color: var(--color-bg);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  ::selection {
+    background: color-mix(in oklab, var(--color-accent) 24%, transparent);
+  }
+
+  /* Refined scrollbars */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-line-strong) transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  *::-webkit-scrollbar-thumb {
+    background-color: var(--color-line-strong);
+    border-radius: 9999px;
+    border: 3px solid transparent;
+    background-clip: padding-box;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background-color: var(--color-faint);
+  }
+
+  input[type='range'] {
+    accent-color: var(--color-accent);
+  }
+}
+
+@layer components {
+  /* Panels / cards */
+  .panel {
+    background-color: var(--color-surface);
+    border: 1px solid var(--color-line);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-sm);
+  }
+
+  .scene-card {
+    background-color: var(--color-surface);
+    border: 1px solid var(--color-line);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-sm);
+    overflow: hidden;
+    transition: box-shadow 160ms ease, transform 160ms ease, border-color 160ms ease;
+  }
+  .scene-card:hover {
+    box-shadow: var(--shadow-md);
+    border-color: var(--color-line-strong);
+  }
+
+  /* Buttons */
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    height: 2.25rem;
+    padding-inline: 0.85rem;
+    border-radius: var(--radius-sm);
+    font-size: 0.875rem;
+    font-weight: 550;
+    line-height: 1;
+    cursor: pointer;
+    user-select: none;
+    border: 1px solid transparent;
+    transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease,
+      box-shadow 120ms ease, transform 80ms ease;
+  }
+  .btn:active {
+    transform: translateY(0.5px);
+  }
+  /* `aria-disabled` counts as disabled here. A control that must explain why
+     it is unavailable cannot use the `disabled` attribute — the browser drops
+     pointer and focus events on it, so its tooltip could never open (see
+     ui/ActionButton.tsx) — so every rule that keys off :disabled has to accept
+     the ARIA state too, or an unavailable button would look pressable. */
+  .btn:disabled,
+  .btn[aria-disabled='true'] {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .btn-primary {
+    background-color: var(--color-accent);
+    color: var(--color-accent-fg);
+    box-shadow: var(--shadow-xs);
+  }
+  .btn-primary:hover:not(:disabled):not([aria-disabled='true']) {
+    background-color: var(--color-accent-hover);
+  }
+  .btn-secondary {
+    background-color: var(--color-surface);
+    border-color: var(--color-line-strong);
+    color: var(--color-ink);
+  }
+  .btn-secondary:hover:not(:disabled):not([aria-disabled='true']) {
+    background-color: var(--color-surface-3);
+  }
+  /* Selected/active secondary (e.g. the matching export preset). The compound
+     selectors out-specify the :hover rule above so the accent fill sticks. */
+  .btn-secondary.is-active {
+    background-color: var(--color-accent-soft);
+    border-color: var(--color-accent);
+    color: var(--color-accent);
+  }
+  .btn-secondary.is-active:hover:not(:disabled):not([aria-disabled='true']) {
+    background-color: color-mix(in oklab, var(--color-accent-soft) 82%, var(--color-accent));
+  }
+  .btn-ghost {
+    background-color: transparent;
+    color: var(--color-ink-2);
+  }
+  .btn-ghost:hover:not(:disabled):not([aria-disabled='true']) {
+    background-color: var(--color-surface-3);
+    color: var(--color-ink);
+  }
+
+  /* Inputs */
+  .input {
+    height: 2.25rem;
+    width: 100%;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--color-line-strong);
+    background-color: var(--color-surface);
+    padding-inline: 0.65rem;
+    font-size: 0.875rem;
+    color: var(--color-ink);
+    transition: border-color 120ms ease, box-shadow 120ms ease;
+  }
+  .input:focus {
+    outline: none;
+    border-color: var(--color-accent);
+    box-shadow: 0 0 0 3px var(--color-accent-soft);
+  }
+
+  /* Field label */
+  .field-label {
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    color: var(--color-muted);
+  }
+
+  /* Canvas-app chrome (the SVG editor's workspace).
+     Nothing in a tool like this is prose: the labels, layer rows, toolbar and
+     status line are all controls, and every one of them is a place a drag can
+     START. Leaving them selectable means pressing on a layer row and moving
+     paints a blue text selection that then fights the gesture for the pointer —
+     and a double-click meant for "rename" or "insert node" highlights a word
+     instead. So the whole workspace opts out, and the places that really are
+     text — the fields you type into — opt back in, or you couldn't select what
+     you're editing inside them. */
+  .canvas-ui {
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  .canvas-ui input,
+  .canvas-ui textarea,
+  .canvas-ui [contenteditable='true'] {
+    -webkit-user-select: text;
+    user-select: text;
+  }
+  /* Belt and braces for the drawing surface: a press-and-move on an <svg> can
+     otherwise start the browser's native element drag, which steals the pointer
+     capture out from under the gesture (the same failure the labs hit on <img>,
+     see labs.css). */
+  .canvas-ui svg {
+    -webkit-user-drag: none;
+  }
+
+  /* Transparency checkerboard (for previewing logos with alpha) */
+  .checkerboard {
+    background-image: linear-gradient(45deg, #e9ebef 25%, transparent 25%),
+      linear-gradient(-45deg, #e9ebef 25%, transparent 25%),
+      linear-gradient(45deg, transparent 75%, #e9ebef 75%),
+      linear-gradient(-45deg, transparent 75%, #e9ebef 75%);
+    background-size: 16px 16px;
+    background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+    background-color: #f6f7f9;
+  }
+  .checkerboard-dark {
+    background-image: linear-gradient(45deg, #2a2d36 25%, transparent 25%),
+      linear-gradient(-45deg, #2a2d36 25%, transparent 25%),
+      linear-gradient(45deg, transparent 75%, #2a2d36 75%),
+      linear-gradient(-45deg, transparent 75%, #2a2d36 75%);
+    background-size: 16px 16px;
+    background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+    background-color: #1c1e26;
+  }
+
+  /* Legal pages (Impressum / Datenschutz) — readable long-form prose. Built on
+     the semantic tokens, so it flips with the dark theme for free. */
+  .legal {
+    color: var(--color-ink-2);
+    font-size: 0.95rem;
+    line-height: 1.7;
+  }
+  .legal h1 {
+    margin: 0 0 0.4rem;
+    font-size: 1.9rem;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    color: var(--color-ink);
+  }
+  .legal h2 {
+    margin: 2rem 0 0.5rem;
+    font-size: 1.18rem;
+    font-weight: 700;
+    color: var(--color-ink);
+  }
+  .legal h3 {
+    margin: 1.3rem 0 0.35rem;
+    font-size: 1rem;
+    font-weight: 650;
+    color: var(--color-ink);
+  }
+  .legal p { margin: 0.6rem 0; }
+  .legal ul { margin: 0.6rem 0; padding-left: 1.3rem; list-style: disc; }
+  .legal li { margin: 0.25rem 0; }
+  .legal a {
+    color: var(--color-accent);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+  .legal a:hover { color: var(--color-accent-hover); }
+  .legal strong { color: var(--color-ink); font-weight: 650; }
+  .legal hr { border: none; border-top: 1px solid var(--color-line); margin: 1.6rem 0; }
+  .legal .lead { font-size: 1.05rem; color: var(--color-ink-2); }
+  .legal .note {
+    margin: 0.6rem 0;
+    padding: 0.75rem 1rem;
+    border-left: 3px solid var(--color-accent);
+    background: var(--color-accent-soft);
+    border-radius: var(--radius-sm);
+    color: var(--color-ink-2);
+    font-size: 0.88rem;
+  }
+  .legal address {
+    font-style: normal;
+    line-height: 1.6;
+  }
+}
+
+@layer utilities {
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  /* Clear the iOS home indicator for fixed bottom UI (action bars, bottom sheets,
+     FABs). Falls back to a comfortable 1.25rem where there's no safe-area inset. */
+  .pb-safe {
+    padding-bottom: max(1.25rem, env(safe-area-inset-bottom));
+  }
+  .bottom-safe {
+    bottom: max(1.25rem, env(safe-area-inset-bottom));
+  }
+  .animate-in-fade {
+    animation: fade-in 220ms ease both;
+  }
+  /* A soft accent band that sweeps across the stage while a trace runs. Pure
+     transform animation ⇒ runs on the compositor, so it stays smooth even when
+     the main thread is busy (e.g. a potrace trace). */
+  .trace-sweep {
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: 38%;
+    background: linear-gradient(
+      90deg,
+      transparent,
+      color-mix(in srgb, var(--color-accent) 16%, transparent),
+      transparent
+    );
+    animation: trace-sweep 1.25s ease-in-out infinite;
+    will-change: transform;
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes trace-sweep {
+  from {
+    transform: translateX(-60%);
+  }
+  to {
+    transform: translateX(230%);
+  }
+}

@@ -1,0 +1,29 @@
+import { Contrast } from './icons'
+import { useStore } from '../../state/store'
+import { Tooltip } from './Tooltip'
+
+/**
+ * Flips the global transparency-checkerboard backdrop (light ⇄ dark). The state
+ * lives in the store, so flipping here changes every preview — cleanup,
+ * vectorize, export — and sticks for the rest of the session.
+ */
+export function CheckerToggle({ className = '' }: { className?: string }) {
+  const dark = useStore((s) => s.checkerDark)
+  const toggle = useStore((s) => s.toggleChecker)
+  return (
+    <Tooltip label={`Flip preview background (now ${dark ? 'dark' : 'light'}) to see white logos better`}>
+      <button
+        type="button"
+        onClick={toggle}
+        aria-label="Flip preview background"
+        className={`flex h-8 w-8 items-center justify-center rounded-lg border shadow-xs transition-colors ${
+          dark
+            ? 'border-white/20 bg-black/40 text-white hover:bg-black/60'
+            : 'border-line-strong bg-surface/80 text-ink-2 hover:bg-surface'
+        } ${className}`}
+      >
+        <Contrast size={15} />
+      </button>
+    </Tooltip>
+  )
+}
